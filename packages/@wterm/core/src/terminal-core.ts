@@ -51,7 +51,7 @@ export interface TerminalResourceState {
 export interface TerminalCore {
   // -- Lifecycle --
   init(cols: number, rows: number): void;
-  resize(cols: number, rows: number): void;
+  resize(cols: number, rows: number, widthPx?: number, heightPx?: number): void;
   /**
    * Release all resources owned by this core. Implementations must tolerate
    * repeated calls and must not throw. The core cannot be reused afterward.
@@ -76,7 +76,7 @@ export interface TerminalCore {
   cursorKeysApp(): boolean;
   bracketedPaste(): boolean;
   usingAltScreen(): boolean;
-  mouseTracking?(): 0 | 1000 | 1002;
+  mouseTracking?(): 0 | 9 | 1000 | 1002 | 1003;
   mouseSgr?(): boolean;
   focusEvents?(): boolean;
   synchronizedOutput?(): boolean;

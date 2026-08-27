@@ -77,7 +77,7 @@ The React and Vue `<Terminal>` components and the vanilla `WTerm` constructor al
       <td><code>autoResize</code></td>
       <td><code>boolean</code></td>
       <td><code>true</code> (vanilla) / <code>false</code> (React, Vue)</td>
-      <td>Automatically resize the terminal to fit its container using a <code>ResizeObserver</code></td>
+      <td>Observe container dimensions. Raw mode resizes locally; semantic mode emits a deduplicated resize request without mutating the replica.</td>
     </tr>
     <tr>
       <td><code>cursorBlink</code></td>
@@ -95,7 +95,13 @@ The React and Vue `<Terminal>` components and the vanilla `WTerm` constructor al
       <td><code>onData</code></td>
       <td><code>(data: string) =&gt; void</code></td>
       <td>—</td>
-      <td>Called when the terminal produces data (user input or host response). When omitted, input is echoed back automatically.</td>
+      <td>Legacy raw-input bytes and core responses. When omitted, raw input is echoed locally. Mutually exclusive with <code>inputSink</code>.</td>
+    </tr>
+    <tr>
+      <td><code>inputSink</code></td>
+      <td><code>InputSink</code></td>
+      <td>—</td>
+      <td>Semantic browser intent for a remote authority. Mutually exclusive with <code>onData</code> or Vue's <code>data</code> listener.</td>
     </tr>
     <tr>
       <td><code>onTitle</code></td>
@@ -111,6 +117,30 @@ The React and Vue `<Terminal>` components and the vanilla `WTerm` constructor al
     </tr>
   </tbody>
 </table>
+
+## Semantic Input
+
+`InputSink` receives a transport-neutral `TerminalInputEvent` union:
+
+```ts
+interface InputSink {
+  send(event: TerminalInputEvent): void;
+}
+
+type TerminalInputEvent =
+  | TerminalKeyInputEvent
+  | TerminalTextInputEvent
+  | TerminalPasteInputEvent
+  | TerminalFocusInputEvent
+  | TerminalMouseInputEvent
+  | TerminalResizeInputEvent;
+```
+
+Key events preserve physical and logical identity, text, modifiers and consumed modifiers, AltGraph, press/release/repeat action, composition state, and the reliably observable unshifted code point. Text events carry committed IME/input text, paste events carry the original clipboard string, and focus events carry deduplicated `true`/`false` transitions.
+
+Mouse events carry action, DOM button/buttons, modifiers, surface pixels, and locally observed cell/viewport geometry. The latter geometry is a replica hint, not authority. A remote session must validate its own resize-generation fence, then encode using the Host terminal's current modes and geometry.
+
+Resize events carry `cols`, `rows`, `widthPx`, and `heightPx`. In semantic mode the observer only sends this request; it does not resize or re-render the replica. After the session orders and accepts it, apply the authoritative state with `WTerm.resize(cols, rows, widthPx, heightPx)`, or call `TerminalCore.resize(...)` on a detached replica before adoption. Explicit apply never emits another input event.
 
 ## React-Only Props
 
@@ -228,8 +258,8 @@ Outside synchronized output, writes request the next animation frame directly. W
       <td>Write data to the terminal</td>
     </tr>
     <tr>
-      <td><code>resize(cols, rows)</code></td>
-      <td>Resize the terminal grid</td>
+      <td><code>resize(cols, rows, widthPx?, heightPx?)</code></td>
+      <td>Apply an authoritative grid and optional CSS-pixel surface size without emitting input</td>
     </tr>
     <tr>
       <td><code>adoptCore(core)</code></td>
@@ -275,8 +305,8 @@ const { ref, write, resize, focus } = useTerminal();
     </tr>
     <tr>
       <td><code>resize</code></td>
-      <td><code>(cols: number, rows: number) =&gt; void</code></td>
-      <td>Resize the terminal grid</td>
+      <td><code>(cols: number, rows: number, widthPx?: number, heightPx?: number) =&gt; void</code></td>
+      <td>Apply an authoritative grid and optional CSS-pixel surface size</td>
     </tr>
     <tr>
       <td><code>focus</code></td>
@@ -291,7 +321,7 @@ The `TerminalHandle` interface exposed via `ref`:
 ```ts
 interface TerminalHandle {
   write(data: string | Uint8Array): void;
-  resize(cols: number, rows: number): void;
+  resize(cols: number, rows: number, widthPx?: number, heightPx?: number): void;
   focus(): void;
   readonly instance: WTerm | null;
 }
@@ -330,8 +360,8 @@ const term = useTemplateRef("term");
     </tr>
     <tr>
       <td><code>resize</code></td>
-      <td><code>(cols: number, rows: number) =&gt; void</code></td>
-      <td>Resize the terminal grid. Calls before mount are ignored.</td>
+      <td><code>(cols: number, rows: number, widthPx?: number, heightPx?: number) =&gt; void</code></td>
+      <td>Apply an authoritative grid and optional CSS-pixel surface size. Calls before mount are ignored.</td>
     </tr>
     <tr>
       <td><code>focus</code></td>
@@ -493,8 +523,8 @@ When no URL is provided, the ~12 KB WASM binary is decoded from a base64 string 
       <td>Write raw bytes and optionally run a callback after each 8192-byte internal chunk</td>
     </tr>
     <tr>
-      <td><code>resize(cols, rows)</code></td>
-      <td>Resize the terminal grid</td>
+      <td><code>resize(cols, rows, widthPx?, heightPx?)</code></td>
+      <td>Resize the terminal grid; alternative cores can retain the authoritative CSS-pixel geometry</td>
     </tr>
     <tr>
       <td><code>getCell(row, col): CellData</code></td>

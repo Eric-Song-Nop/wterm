@@ -51,11 +51,18 @@ The WASM binary is embedded in the package — no extra setup required. To serve
 | `rows` | `number` | `24` | Initial row count |
 | `wasmUrl` | `string` | — | Optional URL to serve the WASM binary separately (embedded by default) |
 | `theme` | `string` | — | Theme name (e.g. `"solarized-dark"`, `"monokai"`, `"light"`) |
-| `autoResize` | `boolean` | `false` | Auto-resize based on container dimensions |
+| `autoResize` | `boolean` | `false` | Observe container dimensions; semantic mode emits resize intent instead of local reflow |
 | `cursorBlink` | `boolean` | `false` | Enable cursor blinking animation |
 | `debug` | `boolean` | `false` | Enable debug mode. Exposes a `DebugAdapter` on the underlying `WTerm` instance for inspecting escape sequences, cell data, render performance, and unhandled CSI sequences. |
+| `inputSink` | `InputSink` | — | Semantic browser intent for a remote authority. Mutually exclusive with the `data` listener. |
 
 Standard DOM attributes (`class`, `style`, `id`, ARIA props, etc.) are forwarded to the root `<div>` via `inheritAttrs`.
+
+For a remote authority, pass semantic input instead of attaching a `data` listener:
+
+```vue
+<Terminal :input-sink="{ send: (event) => session.sendInput(event) }" />
+```
 
 ## Events
 
@@ -92,7 +99,7 @@ function onReady(wt: WTerm) {
 | Member | Type | Description |
 |---|---|---|
 | `write` | `(data: string \| Uint8Array) => void` | Write data to the terminal |
-| `resize` | `(cols: number, rows: number) => void` | Resize the terminal |
+| `resize` | `(cols: number, rows: number, widthPx?: number, heightPx?: number) => void` | Apply an authoritative grid and optional pixel size |
 | `focus` | `() => void` | Focus the terminal |
 | `instance` | `WTerm \| null` | Underlying `WTerm` instance (`null` before mount) |
 

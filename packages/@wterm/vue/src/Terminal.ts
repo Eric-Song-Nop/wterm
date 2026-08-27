@@ -9,7 +9,7 @@ import {
   watch,
   type PropType,
 } from "vue";
-import { WTerm, type TerminalCore } from "@wterm/dom";
+import { WTerm, type InputSink, type TerminalCore } from "@wterm/dom";
 
 /**
  * Vue wrapper around {@link WTerm} from `@wterm/dom`. Creates a `WTerm` in
@@ -92,6 +92,13 @@ const Terminal = defineComponent({
      * @defaultValue false
      */
     debug: Boolean,
+    /**
+     * Semantic browser input sink. Mutually exclusive with a `data` listener.
+     */
+    inputSink: {
+      type: Object as PropType<InputSink>,
+      default: undefined,
+    },
   },
 
   // Object form: validator signatures carry emit payload types to
@@ -125,12 +132,30 @@ const Terminal = defineComponent({
   setup(props, { emit }) {
     const root = ref<HTMLDivElement | null>(null);
     const wterm = shallowRef<WTerm | null>(null);
+    let inputSinkActive = false;
+    const inputSinkProxy: InputSink = {
+      send(event) {
+        if (inputSinkActive) props.inputSink?.send(event);
+      },
+    };
 
     onMounted(() => {
       const el = root.value;
       if (!el) return;
 
       const hasDataListener = !!getCurrentInstance()?.vnode.props?.onData;
+      if (hasDataListener && props.inputSink) {
+        throw new Error(
+          "wterm: the data listener and inputSink are mutually exclusive",
+        );
+      }
+      const inputOptions = props.inputSink
+        ? { inputSink: inputSinkProxy }
+        : {
+            onData: hasDataListener
+              ? (data: string) => emit("data", data)
+              : undefined,
+          };
 
       const wt = new WTerm(el, {
         cols: props.cols,
@@ -140,14 +165,13 @@ const Terminal = defineComponent({
         autoResize: props.autoResize,
         cursorBlink: props.cursorBlink,
         debug: props.debug,
-        onData: hasDataListener
-          ? (data: string) => emit("data", data)
-          : undefined,
+        ...inputOptions,
         onTitle: (title: string) => emit("title", title),
         onResize: (c: number, r: number) => emit("resize", c, r),
       });
 
       wterm.value = wt;
+      inputSinkActive = !!props.inputSink;
 
       wt.init()
         .then(() => {
@@ -159,6 +183,7 @@ const Terminal = defineComponent({
     });
 
     onBeforeUnmount(() => {
+      inputSinkActive = false;
       wterm.value?.destroy();
       wterm.value = null;
     });
@@ -213,8 +238,10 @@ const Terminal = defineComponent({
        * Imperatively resize the terminal. Calls before the component has
        * mounted are ignored.
        */
-      resize(c: number, r: number) {
-        wterm.value?.resize(c, r);
+      resize(c: number, r: number, widthPx?: number, heightPx?: number) {
+        const wt = wterm.value;
+        if (widthPx === undefined && heightPx === undefined) wt?.resize(c, r);
+        else wt?.resize(c, r, widthPx, heightPx);
       },
       /**
        * Move keyboard focus to the terminal.

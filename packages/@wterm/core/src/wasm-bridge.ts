@@ -200,9 +200,11 @@ export class WasmBridge implements TerminalCore {
   usingAltScreen(): boolean {
     return this.exports.getUsingAltScreen() !== 0;
   }
-  mouseTracking(): 0 | 1000 | 1002 {
+  mouseTracking(): 0 | 9 | 1000 | 1002 | 1003 {
     const mode = this.exports.getMouseTracking();
-    return mode === 1000 || mode === 1002 ? mode : 0;
+    return mode === 9 || mode === 1000 || mode === 1002 || mode === 1003
+      ? mode
+      : 0;
   }
   mouseSgr(): boolean {
     return this.exports.getMouseSgr() !== 0;
@@ -314,7 +316,12 @@ export class WasmBridge implements TerminalCore {
     return entries;
   }
 
-  resize(cols: number, rows: number): void {
+  resize(
+    cols: number,
+    rows: number,
+    _widthPx?: number,
+    _heightPx?: number,
+  ): void {
     this.exports.resizeTerminal(cols, rows);
     this._updatePointers();
   }

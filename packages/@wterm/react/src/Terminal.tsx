@@ -5,11 +5,11 @@ import {
   forwardRef,
   type HTMLAttributes,
 } from "react";
-import { WTerm, type TerminalCore } from "@wterm/dom";
+import { WTerm, type InputSink, type TerminalCore } from "@wterm/dom";
 
 // onResize and onError are omitted from HTMLAttributes because we redefine
 // them with different signatures (terminal dimensions / WASM init errors).
-export interface TerminalProps extends Omit<
+interface TerminalBaseProps extends Omit<
   HTMLAttributes<HTMLDivElement>,
   "onResize" | "onError"
 > {
@@ -26,16 +26,21 @@ export interface TerminalProps extends Omit<
   cursorBlink?: boolean;
   /** Enable debug mode (init-only — changing after mount has no effect). */
   debug?: boolean;
-  onData?: (data: string) => void;
   onTitle?: (title: string) => void;
   onResize?: (cols: number, rows: number) => void;
   onReady?: (wt: WTerm) => void;
   onError?: (error: unknown) => void;
 }
 
+export type TerminalProps = TerminalBaseProps &
+  (
+    | { onData?: (data: string) => void; inputSink?: never }
+    | { onData?: never; inputSink: InputSink }
+  );
+
 export interface TerminalHandle {
   write(data: string | Uint8Array): void;
-  resize(cols: number, rows: number): void;
+  resize(cols: number, rows: number, widthPx?: number, heightPx?: number): void;
   focus(): void;
   readonly instance: WTerm | null;
 }
@@ -51,6 +56,7 @@ const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
     cursorBlink = false,
     debug = false,
     onData,
+    inputSink,
     onTitle,
     onResize,
     onReady,
@@ -64,6 +70,7 @@ const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
   const wtermRef = useRef<WTerm | null>(null);
   const callbacksRef = useRef({
     onData,
+    inputSink,
     onTitle,
     onResize,
     onReady,
@@ -71,15 +78,24 @@ const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
   });
   const autoResizeRef = useRef(autoResize);
 
-  callbacksRef.current = { onData, onTitle, onResize, onReady, onError };
+  callbacksRef.current = {
+    onData,
+    inputSink,
+    onTitle,
+    onResize,
+    onReady,
+    onError,
+  };
   autoResizeRef.current = autoResize;
 
   useImperativeHandle(ref, () => ({
     write(data: string | Uint8Array) {
       wtermRef.current?.write(data);
     },
-    resize(c: number, r: number) {
-      wtermRef.current?.resize(c, r);
+    resize(c: number, r: number, widthPx?: number, heightPx?: number) {
+      const wt = wtermRef.current;
+      if (widthPx === undefined && heightPx === undefined) wt?.resize(c, r);
+      else wt?.resize(c, r, widthPx, heightPx);
     },
     focus() {
       wtermRef.current?.focus();
@@ -95,6 +111,18 @@ const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
     (el: HTMLDivElement | null) => {
       if (!el) return;
 
+      const inputOptions = callbacksRef.current.inputSink
+        ? {
+            inputSink: {
+              send: (event: Parameters<InputSink["send"]>[0]) =>
+                callbacksRef.current.inputSink?.send(event),
+            },
+          }
+        : {
+            onData: callbacksRef.current.onData
+              ? (data: string) => callbacksRef.current.onData?.(data)
+              : undefined,
+          };
       const wt = new WTerm(el, {
         cols,
         rows,
@@ -103,9 +131,7 @@ const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
         autoResize: autoResizeRef.current,
         cursorBlink,
         debug,
-        onData: callbacksRef.current.onData
-          ? (data: string) => callbacksRef.current.onData?.(data)
-          : undefined,
+        ...inputOptions,
         onTitle: (title: string) => callbacksRef.current.onTitle?.(title),
         onResize: (c: number, r: number) =>
           callbacksRef.current.onResize?.(c, r),
@@ -130,9 +156,9 @@ const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
         wtermRef.current = null;
       };
     },
-    // Re-run only when the WASM source changes
+    // Re-run when the WASM source or input boundary changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [core, wasmUrl],
+    [core, wasmUrl, inputSink ? "semantic" : "raw"],
   );
 
   // Sync props to the existing instance (render-time checks)
@@ -147,9 +173,9 @@ const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
     } else if (!cursorBlink && el.classList.contains("cursor-blink")) {
       el.classList.remove("cursor-blink");
     }
-    if (onData && !wt.onData) {
+    if (!inputSink && onData && !wt.onData) {
       wt.onData = (data: string) => callbacksRef.current.onData?.(data);
-    } else if (!onData && wt.onData) {
+    } else if ((!onData || inputSink) && wt.onData) {
       wt.onData = null;
     }
   }

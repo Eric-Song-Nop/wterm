@@ -4,7 +4,7 @@ Full-featured terminal emulation core for [wterm](https://github.com/vercel-labs
 
 Drop-in replacement for wterm's built-in Zig core. Implements the same `TerminalCore` interface with comprehensive VT emulation: proper Unicode grapheme handling, all SGR attributes, terminal modes, and more.
 
-The core exposes SGR mouse tracking (modes 1000, 1002, and 1006), focus reporting (mode 1004), synchronized-output state (mode 2026), and terminal responses including foreground/background color queries (OSC 10 and OSC 11) to `@wterm/dom`.
+The core exposes X10/normal/button/any mouse tracking (modes 9, 1000, 1002, and 1003), SGR and SGR-pixel coordinates (1006 and 1016), focus reporting (1004), synchronized-output state (2026), and terminal responses including foreground/background color queries (OSC 10 and OSC 11) to `@wterm/dom`.
 Combining marks and ZWJ emoji are exposed through `CellData.chars` as complete strings, including after their rows move into scrollback.
 Native OSC 8 hyperlinks are resolved from Ghostty's page-owned metadata and exposed through `CellData.linkUri`, `CellData.linkId`, and `CellData.linkKey` in both the viewport and scrollback.
 
@@ -137,6 +137,18 @@ The same core exposes the protocol boundary needed by a remote terminal host:
 const keyBytes = authority.encodeKey({ key: "ArrowUp" });
 const pasteBytes = authority.encodePaste("hello\n");
 const focusBytes = authority.encodeFocus(true);
+authority.resize(80, 24, 800, 408);
+const mouseBytes = authority.encodeMouse({
+  action: mouseEvent.action,
+  button: mouseEvent.button,
+  buttons: mouseEvent.buttons,
+  modifiers: mouseEvent.modifiers,
+  altGraph: mouseEvent.altGraph,
+  surface: mouseEvent.surface,
+  deltaX: mouseEvent.deltaX,
+  deltaY: mouseEvent.deltaY,
+  deltaMode: mouseEvent.deltaMode,
+});
 
 authority.writeRaw(ptyOutput);
 const ptyReplies = authority.drainEffects();
@@ -144,7 +156,9 @@ const checkpoint = authority.encodeSnapshot();
 const continuation = authority.getContinuation();
 ```
 
-Browser code should call `ghosttyKeyEventFromDom(event)` once and send the normalized object unchanged. The helper selects a non-empty physical `KeyboardEvent.code` (falling back to the logical key), preserves UTF-8 `text`, action, AltGraph, composition, and consumed-modifier metadata, and removes the synthetic Ctrl+Alt pair browsers report for AltGraph text. The Host passes those fields directly to `encodeKey()`; it must not implement a second normalization path.
+Browser code should call `ghosttyKeyEventFromDom(event)` once and send the normalized object unchanged. The shared helper preserves physical `KeyboardEvent.code`, logical key, UTF-8 `text`, press/release/repeat action, AltGraph, composition, consumed modifiers, and the reliably observable unshifted code point. It also removes the synthetic Ctrl+Alt pair browsers report for AltGraph text. The Host passes those fields directly to `encodeKey()`; it must not implement a second normalization path.
+
+`encodeMouse()` accepts only the pointer intent needed by the authority; replica `cell` and `viewport` observations are deliberately outside its public input type. It delegates to Ghostty's encoder rather than constructing VT sequences in JavaScript, selects the active authoritative tracking/coordinate modes, recomputes coordinates from surface pixels and the authority's last `resize()` geometry, owns pressed-button state, and deduplicates motion by reported cell. Focus loss, resize, restore, and every mouse mode/format transition reset the relevant encoder state. The session layer must reject stale resize generations before calling it.
 
 `drainEffects()` returns binary `WRITE_PTY` frames in production order. The queue is bounded to 256 frames and 64 KiB; a write that overflows it throws `GhosttyMutationError` with `mutationCommitted: true` and `fatal: true`, increments `getEffectStats()`, and poisons the core. The Host must drain diagnostics, terminate the session, and rebuild from a new PTY. It must never retry that write because Ghostty already applied it.
 

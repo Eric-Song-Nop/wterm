@@ -8,9 +8,17 @@ export function useTerminal() {
     ref.current?.write(data);
   }, []);
 
-  const resize = useCallback((cols: number, rows: number) => {
-    ref.current?.resize(cols, rows);
-  }, []);
+  const resize = useCallback(
+    (cols: number, rows: number, widthPx?: number, heightPx?: number) => {
+      const handle = ref.current;
+      if (widthPx === undefined && heightPx === undefined) {
+        handle?.resize(cols, rows);
+      } else {
+        handle?.resize(cols, rows, widthPx, heightPx);
+      }
+    },
+    [],
+  );
 
   const focus = useCallback(() => {
     ref.current?.focus();

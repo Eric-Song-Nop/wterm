@@ -49,15 +49,22 @@ The WASM binary is embedded in the package — no extra setup required. To serve
 | `rows` | `number` | `24` | Initial row count |
 | `wasmUrl` | `string` | — | Optional URL to serve the WASM binary separately (embedded by default) |
 | `theme` | `string` | — | Theme name (e.g. `"solarized-dark"`, `"monokai"`, `"light"`) |
-| `autoResize` | `boolean` | `false` | Auto-resize based on container dimensions |
+| `autoResize` | `boolean` | `false` | Observe container dimensions; semantic mode emits resize intent instead of local reflow |
 | `cursorBlink` | `boolean` | `false` | Enable cursor blinking animation |
 | `debug` | `boolean` | `false` | Enable debug mode. Exposes a `DebugAdapter` on the underlying `WTerm` instance for inspecting escape sequences, cell data, render performance, and unhandled CSI sequences. |
-| `onData` | `(data: string) => void` | — | Called when the terminal produces data (user input or host response). When omitted, input is echoed back automatically. |
+| `onData` | `(data: string) => void` | — | Legacy raw-input bytes and core responses. Mutually exclusive with `inputSink`. |
+| `inputSink` | `InputSink` | — | Semantic browser intent for a remote authority. Mutually exclusive with `onData`. |
 | `onTitle` | `(title: string) => void` | — | Called when the terminal title changes |
 | `onResize` | `(cols: number, rows: number) => void` | — | Called on resize |
 | `onReady` | `(wt: WTerm) => void` | — | Called after WASM is loaded and the terminal is initialized |
 
 Standard `div` props (`className`, `style`, `id`, etc.) are forwarded to the container element.
+
+Use `inputSink` for remote sessions whose Host owns terminal modes and PTY encoding:
+
+```tsx
+<Terminal inputSink={{ send: (event) => session.sendInput(event) }} />
+```
 
 ## `useTerminal` Hook
 
@@ -71,7 +78,7 @@ const { ref, write, resize, focus } = useTerminal();
 |---|---|---|
 | `ref` | `React.RefObject<TerminalHandle>` | Pass to `<Terminal ref={ref}>` |
 | `write` | `(data: string \| Uint8Array) => void` | Write data to the terminal |
-| `resize` | `(cols: number, rows: number) => void` | Resize the terminal |
+| `resize` | `(cols: number, rows: number, widthPx?: number, heightPx?: number) => void` | Apply an authoritative grid and optional pixel size |
 | `focus` | `() => void` | Focus the terminal |
 
 ## `TerminalHandle`
@@ -81,7 +88,7 @@ The imperative handle exposed via `ref`:
 ```ts
 interface TerminalHandle {
   write(data: string | Uint8Array): void;
-  resize(cols: number, rows: number): void;
+  resize(cols: number, rows: number, widthPx?: number, heightPx?: number): void;
   focus(): void;
   readonly instance: WTerm | null;
 }

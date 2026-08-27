@@ -2,9 +2,26 @@
 
 ## Options
 
-The React and Vue `Terminal` components and the vanilla `WTerm` constructor accept the same core options — `cols`, `rows`, `core`, `wasmUrl`, `autoResize`, `cursorBlink`, and `debug` — plus event callbacks `onData`, `onTitle`, and `onResize` (exposed as `@data`, `@title`, `@resize` events in Vue).
+The React and Vue `Terminal` components and the vanilla `WTerm` constructor accept the same core options — `cols`, `rows`, `core`, `wasmUrl`, `autoResize`, `cursorBlink`, and `debug` — plus `inputSink` and event callbacks `onData`, `onTitle`, and `onResize` (exposed as `@data`, `@title`, `@resize` events in Vue).
 
 See the full [API Reference](/api-reference#terminal-options) for types, defaults, and descriptions.
+
+### Raw and semantic input
+
+Use `onData` for a local terminal or a legacy backend that expects bytes encoded from this terminal core. Use `inputSink` when a remote Host owns the PTY and authoritative Ghostty state:
+
+```ts
+const term = new WTerm(element, {
+  core: replica,
+  inputSink: {
+    send(event) {
+      session.sendInput(event);
+    },
+  },
+});
+```
+
+The options are mutually exclusive in TypeScript and at runtime. Semantic mode never calls `onData` or derives final PTY bytes from replica modes. Its `ResizeObserver` emits a deduplicated `{ type: "resize", cols, rows, widthPx, heightPx }` request without reflowing the replica. Ordering and resize-generation fences belong to the session protocol outside wterm; apply accepted authority state with `WTerm.resize(cols, rows, widthPx, heightPx)` without creating an input loop.
 
 ### Pluggable cores
 

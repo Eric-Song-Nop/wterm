@@ -1,4 +1,9 @@
-import { WasmBridge, type TerminalCore } from "@wterm/core";
+import {
+  WasmBridge,
+  type InputSink,
+  type TerminalCore,
+  type TerminalInputEvent,
+} from "@wterm/core";
 import { Renderer } from "./renderer.js";
 import { InputHandler } from "./input.js";
 import { DebugAdapter } from "./debug.js";
@@ -7,7 +12,7 @@ import { isLinkActivationModifier } from "./hyperlink.js";
 const SYNCHRONIZED_OUTPUT_TIMEOUT_MS = 1000;
 const PROGRAMMATIC_SCROLL_TOLERANCE = 1;
 
-export interface WTermOptions {
+interface WTermBaseOptions {
   cols?: number;
   rows?: number;
   /**
@@ -20,10 +25,23 @@ export interface WTermOptions {
   autoResize?: boolean;
   cursorBlink?: boolean;
   debug?: boolean;
-  onData?: (data: string) => void;
   onTitle?: (title: string) => void;
   onResize?: (cols: number, rows: number) => void;
 }
+
+export type WTermOptions = WTermBaseOptions &
+  (
+    | {
+        /** Legacy local/raw input bytes, encoded from the active replica. */
+        onData?: (data: string) => void;
+        inputSink?: never;
+      }
+    | {
+        onData?: never;
+        /** Browser intent for an authority to encode against its own modes. */
+        inputSink: InputSink;
+      }
+  );
 
 export class WTerm {
   element: HTMLElement;
@@ -34,6 +52,7 @@ export class WTerm {
   debug: DebugAdapter | null = null;
 
   private _ownedCore: TerminalCore | null;
+  private readonly _inputSink: InputSink | null;
   private wasmUrl: string | undefined;
   private _debugEnabled: boolean;
   private renderer: Renderer | null = null;
@@ -44,6 +63,12 @@ export class WTerm {
   private _synchronizedOutputGeneration = 0;
   private _rendererNeedsSetup = false;
   private resizeObserver: ResizeObserver | null = null;
+  private _lastRequestedResize: {
+    cols: number;
+    rows: number;
+    widthPx: number;
+    heightPx: number;
+  } | null = null;
   private _destroyed = false;
   private _initialized = false;
   private _initializing = false;
@@ -65,8 +90,12 @@ export class WTerm {
   private _container: HTMLDivElement;
 
   constructor(element: HTMLElement, options: WTermOptions = {}) {
+    if (options.onData !== undefined && options.inputSink !== undefined) {
+      throw new Error("wterm: onData and inputSink are mutually exclusive");
+    }
     this.element = element;
     this._ownedCore = options.core ?? null;
+    this._inputSink = options.inputSink ?? null;
     this.wasmUrl = options.wasmUrl;
     this.cols = options.cols || 80;
     this.rows = options.rows || 24;
@@ -178,22 +207,35 @@ export class WTerm {
       this.renderer = new Renderer(this._container);
       this.renderer.setup(this.cols, this.rows);
 
-      this.input = new InputHandler(
-        this.element,
-        (data) => {
-          this._scrollToBottom();
-          if (this.onData) {
-            this.onData(data);
-          } else {
-            this.write(data);
-          }
-        },
-        () => this.bridge,
-        () =>
-          this._charWidth > 0 && this._rowHeight > 0
-            ? { charWidth: this._charWidth, rowHeight: this._rowHeight }
-            : null,
-      );
+      const getCore = () => this.bridge;
+      const getCellSize = () =>
+        this._charWidth > 0 && this._rowHeight > 0
+          ? { charWidth: this._charWidth, rowHeight: this._rowHeight }
+          : null;
+      if (this._inputSink) {
+        this.input = new InputHandler(
+          this.element,
+          {
+            send: (event) => this._sendSemanticInput(event),
+          },
+          getCore,
+          getCellSize,
+        );
+      } else {
+        this.input = new InputHandler(
+          this.element,
+          (data) => {
+            this._scrollToBottom();
+            if (this.onData) {
+              this.onData(data);
+            } else {
+              this.write(data);
+            }
+          },
+          getCore,
+          getCellSize,
+        );
+      }
 
       if (this.autoResize) {
         this._setupResizeObserver();
@@ -223,6 +265,19 @@ export class WTerm {
 
   private _scrollToBottom(): void {
     this._setScrollTop(this.element.scrollHeight);
+  }
+
+  private _sendSemanticInput(event: TerminalInputEvent): void {
+    if (
+      (event.type === "key" && event.action !== "release") ||
+      event.type === "text" ||
+      event.type === "paste" ||
+      (event.type === "mouse" &&
+        (event.action === "press" || event.action === "wheel"))
+    ) {
+      this._scrollToBottom();
+    }
+    this._inputSink?.send(event);
   }
 
   private _setScrollTop(value: number): void {
@@ -345,13 +400,23 @@ export class WTerm {
     previousCore.dispose();
   }
 
-  resize(cols: number, rows: number): void {
+  /** Apply an authoritative grid and pixel size without emitting input. */
+  resize(
+    cols: number,
+    rows: number,
+    widthPx?: number,
+    heightPx?: number,
+  ): void {
     if (!this.bridge) return;
     this._shouldScrollToBottom =
       this._pendingResizeScrollTop === null && this._isScrolledToBottom();
     this.cols = cols;
     this.rows = rows;
-    this.bridge.resize(cols, rows);
+    if (widthPx === undefined && heightPx === undefined) {
+      this.bridge.resize(cols, rows);
+    } else {
+      this.bridge.resize(cols, rows, widthPx, heightPx);
+    }
     const synchronized = this.bridge.synchronizedOutput?.() ?? false;
     const generation = this.bridge.synchronizedOutputGeneration?.() ?? 0;
     if (this._updateSynchronizedOutput(synchronized, generation)) {
@@ -539,7 +604,7 @@ export class WTerm {
     let hasError = false;
     while ((response = this.bridge.getResponse()) !== null) {
       try {
-        if (this.onData) this.onData(response);
+        if (!this._inputSink && this.onData) this.onData(response);
       } catch (error) {
         if (!hasError) {
           hasError = true;
@@ -611,6 +676,7 @@ export class WTerm {
     let { charWidth, rowHeight } = initial;
 
     this.resizeObserver = new ResizeObserver((entries) => {
+      if (this._destroyed) return;
       const measured = this._measureCharSize();
       if (measured) {
         charWidth = measured.charWidth;
@@ -619,10 +685,36 @@ export class WTerm {
 
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
+        if (!Number.isFinite(width) || !Number.isFinite(height)) continue;
         const newCols = Math.max(1, Math.floor(width / charWidth));
         const newRows = Math.max(1, Math.floor(height / rowHeight));
+        const widthPx = Math.max(0, Math.round(width));
+        const heightPx = Math.max(0, Math.round(height));
+        if (this._inputSink) {
+          const previous = this._lastRequestedResize;
+          if (
+            previous?.cols === newCols &&
+            previous.rows === newRows &&
+            previous.widthPx === widthPx &&
+            previous.heightPx === heightPx
+          ) {
+            continue;
+          }
+          const request = {
+            cols: newCols,
+            rows: newRows,
+            widthPx,
+            heightPx,
+          };
+          this._sendSemanticInput({
+            type: "resize",
+            ...request,
+          });
+          this._lastRequestedResize = request;
+          continue;
+        }
         if (newCols !== this.cols || newRows !== this.rows) {
-          this.resize(newCols, newRows);
+          this.resize(newCols, newRows, widthPx, heightPx);
         }
       }
     });
@@ -639,6 +731,7 @@ export class WTerm {
     this._cancelScheduledRender();
     this._cancelSynchronizedOutputFallback();
     if (this.resizeObserver) this.resizeObserver.disconnect();
+    this._lastRequestedResize = null;
     if (this.input) this.input.destroy();
     this.element.removeEventListener("click", this._onClickFocus);
     this.element.removeEventListener("scroll", this._onScroll);
