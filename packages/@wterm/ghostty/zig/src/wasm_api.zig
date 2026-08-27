@@ -6,12 +6,36 @@ const Screen = vt.Screen;
 const RenderState = vt.RenderState;
 const Style = vt.Style;
 const color = vt.color;
-const modes = vt.modes;
-const ReadonlyHandler = vt.ReadonlyHandler;
+const ColorScheme = vt.device_status.ColorScheme;
 const StreamAction = vt.StreamAction;
+const TerminalHandler = vt.TerminalStream.Handler;
+const SizeCallbackPtr = @typeInfo(@FieldType(TerminalHandler.Effects, "size")).optional.child;
+const SizeCallbackFn = @typeInfo(SizeCallbackPtr).pointer.child;
+const SizeCallbackReturn = @typeInfo(SizeCallbackFn).@"fn".return_type.?;
+const TerminalSize = @typeInfo(SizeCallbackReturn).optional.child;
+const DeviceAttributesCallbackPtr = @typeInfo(@FieldType(TerminalHandler.Effects, "device_attributes")).optional.child;
+const DeviceAttributesCallbackFn = @typeInfo(DeviceAttributesCallbackPtr).pointer.child;
+const DeviceAttributes = @typeInfo(DeviceAttributesCallbackFn).@"fn".return_type.?;
 
 const Allocator = std.mem.Allocator;
 const allocator = std.heap.wasm_allocator;
+const engine_manifest = @import("engine_manifest.zig");
+const BUILD_ID = engine_manifest.build_id;
+const TERMINAL_NAME = engine_manifest.terminal_name;
+const XTVERSION = engine_manifest.xtversion;
+const OUTPUT_ERROR = std.math.maxInt(u32);
+const CONTINUATION_MAX_BYTES = 64 * 1024;
+const PASTE_MAX_BYTES = 1024 * 1024;
+const MUTATION_OK = 0;
+const MUTATION_SEMANTIC_FAILURE = 1;
+const MUTATION_EFFECT_OVERFLOW = 2;
+const MUTATION_RESIZE_FAILURE = 3;
+const RENDER_OK = 0;
+const RENDER_FAILURE = 1;
+
+fn isUnicodeScalar(value: u32) bool {
+    return value <= 0x10FFFF and !(value >= 0xD800 and value <= 0xDFFF);
+}
 
 pub const std_options: std.Options = .{
     .logFn = wasmLog,
@@ -59,77 +83,149 @@ const JS = struct {
 // ---------------------------------------------------------------
 const CELL_BYTES = 16;
 
-// -- Responses --------------------------------------------------
+// -- PTY effects ------------------------------------------------
 //
-// Queries reach the terminal on the same stream as everything else, and the
-// host reads their answers back out one at a time. The queue is fixed-size and
-// drops the newest response when full, so the answers that are kept stay in the
-// order they were produced. This mirrors the built-in core's contract.
+// Effects run synchronously inside TerminalStream.nextSlice. The authority
+// copies WRITE_PTY payloads into this bounded queue and JS drains it only after
+// the write returns, avoiding re-entrancy and blocking I/O in Ghostty callbacks.
 
-const RESPONSE_QUEUE_MAX = 256;
-const RESPONSE_MAX_BYTES = 64;
+const EFFECT_QUEUE_MAX_FRAMES = 256;
+const EFFECT_QUEUE_MAX_BYTES = 64 * 1024;
 
-const ResponseQueue = struct {
-    slots: [RESPONSE_QUEUE_MAX][RESPONSE_MAX_BYTES]u8 = undefined,
-    lens: [RESPONSE_QUEUE_MAX]u8 = [_]u8{0} ** RESPONSE_QUEUE_MAX,
-    head: u16 = 0,
-    tail: u16 = 0,
-    count: u16 = 0,
+const EffectQueue = struct {
+    bytes: [EFFECT_QUEUE_MAX_BYTES]u8 = undefined,
+    frame_lens: [EFFECT_QUEUE_MAX_FRAMES]u32 = [_]u32{0} ** EFFECT_QUEUE_MAX_FRAMES,
+    byte_head: usize = 0,
+    byte_tail: usize = 0,
+    byte_count: usize = 0,
+    frame_head: u16 = 0,
+    frame_tail: u16 = 0,
+    frame_count: u16 = 0,
+    dropped_frames: u32 = 0,
+    dropped_bytes: u32 = 0,
 
-    fn push(self: *ResponseQueue, bytes: []const u8) void {
-        if (bytes.len > RESPONSE_MAX_BYTES) return;
-        if (self.count == RESPONSE_QUEUE_MAX) return;
-        @memcpy(self.slots[self.tail][0..bytes.len], bytes);
-        self.lens[self.tail] = @intCast(bytes.len);
-        self.tail = (self.tail + 1) % RESPONSE_QUEUE_MAX;
-        self.count += 1;
+    fn push(self: *EffectQueue, payload: []const u8) void {
+        if (payload.len == 0) return;
+        if (payload.len > EFFECT_QUEUE_MAX_BYTES - self.byte_count or
+            self.frame_count == EFFECT_QUEUE_MAX_FRAMES)
+        {
+            self.dropped_frames +|= 1;
+            self.dropped_bytes +|= std.math.cast(u32, payload.len) orelse std.math.maxInt(u32);
+            return;
+        }
+
+        const first_len = @min(payload.len, EFFECT_QUEUE_MAX_BYTES - self.byte_tail);
+        @memcpy(self.bytes[self.byte_tail .. self.byte_tail + first_len], payload[0..first_len]);
+        const second_len = payload.len - first_len;
+        if (second_len > 0) @memcpy(self.bytes[0..second_len], payload[first_len..]);
+
+        self.frame_lens[self.frame_tail] = @intCast(payload.len);
+        self.frame_tail = (self.frame_tail + 1) % EFFECT_QUEUE_MAX_FRAMES;
+        self.frame_count += 1;
+        self.byte_tail = (self.byte_tail + payload.len) % EFFECT_QUEUE_MAX_BYTES;
+        self.byte_count += payload.len;
     }
 
-    fn pop(self: *ResponseQueue, out: []u8) u32 {
-        if (self.count == 0) return 0;
-        const len = self.lens[self.head];
+    fn peekLen(self: *const EffectQueue) u32 {
+        if (self.frame_count == 0) return 0;
+        return self.frame_lens[self.frame_head];
+    }
+
+    fn pop(self: *EffectQueue, out: []u8) u32 {
+        const len = self.peekLen();
+        if (len == 0) return 0;
         if (len > out.len) return 0;
-        @memcpy(out[0..len], self.slots[self.head][0..len]);
-        self.head = (self.head + 1) % RESPONSE_QUEUE_MAX;
-        self.count -= 1;
+
+        const payload_len: usize = len;
+        const first_len = @min(payload_len, EFFECT_QUEUE_MAX_BYTES - self.byte_head);
+        @memcpy(out[0..first_len], self.bytes[self.byte_head .. self.byte_head + first_len]);
+        const second_len = payload_len - first_len;
+        if (second_len > 0) @memcpy(out[first_len..payload_len], self.bytes[0..second_len]);
+
+        self.frame_head = (self.frame_head + 1) % EFFECT_QUEUE_MAX_FRAMES;
+        self.frame_count -= 1;
+        self.byte_head = (self.byte_head + payload_len) % EFFECT_QUEUE_MAX_BYTES;
+        self.byte_count -= payload_len;
         return len;
     }
 };
 
-/// Wraps ghostty's own readonly handler instead of reimplementing it. Every
-/// action that mutates terminal state is delegated untouched; only the query
-/// actions, which the readonly handler documents as having "no terminal
-/// modifying effect" and drops, are answered here.
-const ResponseHandler = struct {
-    inner: ReadonlyHandler,
-    queue: *ResponseQueue,
+/// Delegates terminal semantics to Ghostty's standard handler. Authority mode
+/// installs WRITE_PTY and query effects; replica mode leaves them disabled.
+const WTermHandler = struct {
+    inner: TerminalHandler,
+    effects: *EffectQueue,
     synchronized_output_generation: *u32,
 
     pub fn init(
         terminal: *Terminal,
-        queue: *ResponseQueue,
+        effects: *EffectQueue,
         generation: *u32,
-    ) ResponseHandler {
-        return .{
+        authority: bool,
+    ) WTermHandler {
+        var result: WTermHandler = .{
             .inner = .init(terminal),
-            .queue = queue,
+            .effects = effects,
             .synchronized_output_generation = generation,
+        };
+        if (authority) {
+            result.inner.effects.write_pty = &writePty;
+            result.inner.effects.size = &terminalSize;
+            result.inner.effects.color_scheme = &colorScheme;
+            result.inner.effects.device_attributes = &deviceAttributes;
+            result.inner.effects.xtversion = &xtversion;
+        }
+        result.inner.terminfo_name = TERMINAL_NAME;
+        return result;
+    }
+
+    fn fromInner(handler: *TerminalHandler) *WTermHandler {
+        return @fieldParentPtr("inner", handler);
+    }
+
+    fn writePty(handler: *TerminalHandler, bytes: []const u8) void {
+        fromInner(handler).effects.push(bytes);
+    }
+
+    fn terminalSize(handler: *TerminalHandler) ?TerminalSize {
+        const terminal = handler.terminal;
+        return .{
+            .rows = terminal.rows,
+            .columns = terminal.cols,
+            .cell_width = if (terminal.cols > 0) terminal.width_px / terminal.cols else 0,
+            .cell_height = if (terminal.rows > 0) terminal.height_px / terminal.rows else 0,
         };
     }
 
-    pub fn deinit(self: *ResponseHandler) void {
+    fn colorScheme(handler: *TerminalHandler) ?ColorScheme {
+        const background = handler.terminal.colors.background.get() orelse return .dark;
+        const luminance = @as(u32, background.r) * 299 +
+            @as(u32, background.g) * 587 +
+            @as(u32, background.b) * 114;
+        return if (luminance >= 128_000) .light else .dark;
+    }
+
+    fn deviceAttributes(_: *TerminalHandler) DeviceAttributes {
+        return .{};
+    }
+
+    fn xtversion(_: *TerminalHandler) []const u8 {
+        return XTVERSION;
+    }
+
+    pub fn deinit(self: *WTermHandler) void {
         self.inner.deinit();
     }
 
     pub fn vt(
-        self: *ResponseHandler,
+        self: *WTermHandler,
         comptime action: StreamAction.Tag,
         value: StreamAction.Value(action),
-    ) !void {
+    ) void {
         switch (action) {
             .set_mode => {
                 const was_synchronized = self.inner.terminal.modes.get(.synchronized_output);
-                try self.inner.vt(action, value);
+                self.inner.vt(action, value);
                 if (value.mode == .synchronized_output and
                     !was_synchronized and
                     self.inner.terminal.modes.get(.synchronized_output))
@@ -139,7 +235,7 @@ const ResponseHandler = struct {
             },
             .restore_mode => {
                 const was_synchronized = self.inner.terminal.modes.get(.synchronized_output);
-                try self.inner.vt(action, value);
+                self.inner.vt(action, value);
                 if (value.mode == .synchronized_output and
                     !was_synchronized and
                     self.inner.terminal.modes.get(.synchronized_output))
@@ -147,106 +243,47 @@ const ResponseHandler = struct {
                     self.synchronized_output_generation.* +%= 1;
                 }
             },
-            .device_attributes => switch (value) {
-                // VT100 with the advanced video option, matching the control
-                // the parity suite measures against. Every code claimed here
-                // must have a handler; do not widen it without one.
-                .primary => self.queue.push("\x1b[?1;2c"),
-                else => {},
-            },
-            .device_status => switch (value.request) {
-                .operating_status => self.queue.push("\x1b[0n"),
-                .cursor_position => {
-                    const cursor = self.inner.terminal.screens.active.cursor;
-                    var buf: [RESPONSE_MAX_BYTES]u8 = undefined;
-                    const out = std.fmt.bufPrint(
-                        &buf,
-                        "\x1b[{d};{d}R",
-                        .{ cursor.y + 1, cursor.x + 1 },
-                    ) catch return;
-                    self.queue.push(out);
-                },
-                else => {},
-            },
-            .request_mode => {
-                // DECRPM reads the same mode state the set/reset path writes,
-                // so a reported mode cannot drift from the implemented one.
-                // Mode packs its number together with an ansi flag, and only
-                // DEC private modes carry the `?` prefix, so both come from
-                // the unpacked tag rather than the raw enum value.
-                const mode = value.mode;
-                const set = self.inner.terminal.modes.get(mode);
-                const tag: modes.ModeTag = @bitCast(@intFromEnum(mode));
-                var buf: [RESPONSE_MAX_BYTES]u8 = undefined;
-                const out = std.fmt.bufPrint(
-                    &buf,
-                    "\x1b[{s}{d};{d}$y",
-                    .{
-                        if (tag.ansi) "" else "?",
-                        tag.value,
-                        @as(u8, if (set) 1 else 2),
-                    },
-                ) catch return;
-                self.queue.push(out);
-            },
-            .request_mode_unknown => {
-                var buf: [RESPONSE_MAX_BYTES]u8 = undefined;
-                const out = std.fmt.bufPrint(
-                    &buf,
-                    "\x1b[{s}{d};0$y",
-                    .{ if (value.ansi) "" else "?", value.mode },
-                ) catch return;
-                self.queue.push(out);
-            },
-            .color_operation => {
-                try self.inner.vt(action, value);
-                var it = value.requests.constIterator(0);
-                while (it.next()) |request| {
-                    const target = switch (request.*) {
-                        .query => |target| target,
-                        else => continue,
-                    };
-                    const dynamic = switch (target) {
-                        .dynamic => |dynamic| dynamic,
-                        else => continue,
-                    };
-                    const terminal_color = switch (dynamic) {
-                        .foreground => self.inner.terminal.colors.foreground.get() orelse continue,
-                        .background => self.inner.terminal.colors.background.get() orelse continue,
-                        else => continue,
-                    };
-                    var buf: [RESPONSE_MAX_BYTES]u8 = undefined;
-                    const out = std.fmt.bufPrint(
-                        &buf,
-                        "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}{s}",
-                        .{
-                            @intFromEnum(dynamic),
-                            @as(u16, terminal_color.r) * 257,
-                            @as(u16, terminal_color.g) * 257,
-                            @as(u16, terminal_color.b) * 257,
-                            value.terminator.string(),
-                        },
-                    ) catch continue;
-                    self.queue.push(out);
-                }
-            },
-            else => try self.inner.vt(action, value),
+            else => self.inner.vt(action, value),
         }
     }
 };
 
-const ResponseStream = vt.Stream(ResponseHandler);
+const WTermStream = vt.Stream(WTermHandler);
 
 const State = struct {
     terminal: Terminal,
-    stream: ResponseStream,
+    stream: WTermStream,
     render: RenderState,
-    responses: ResponseQueue,
+    effects: EffectQueue,
     synchronized_output_generation: u32,
+    output: []u8,
 };
 
 fn stateFromPtr(ptr: usize) *State {
     return @ptrFromInt(ptr);
+}
+
+fn replaceOutput(state: *State, bytes: []u8) void {
+    if (state.output.len > 0) allocator.free(state.output);
+    state.output = bytes;
+}
+
+fn finishOutput(state: *State, writer: *std.Io.Writer.Allocating) u32 {
+    const bytes = writer.toOwnedSlice() catch return OUTPUT_ERROR;
+    const len = std.math.cast(u32, bytes.len) orelse {
+        if (bytes.len > 0) allocator.free(bytes);
+        return OUTPUT_ERROR;
+    };
+    replaceOutput(state, bytes);
+    return len;
+}
+
+fn writeContinuation(
+    state: *const State,
+    writer: *std.Io.Writer,
+) bool {
+    state.stream.writeContinuation(writer) catch return false;
+    return true;
 }
 
 // -- Lifecycle --------------------------------------------------
@@ -257,12 +294,14 @@ export fn init(
     max_scrollback: u32,
     foreground_rgb: u32,
     background_rgb: u32,
+    effects_mode: u32,
 ) usize {
     const state = allocator.create(State) catch return 0;
-    state.terminal = Terminal.init(allocator, .{
+    state.terminal = Terminal.init((vt.TinyIo.init).io(), allocator, .{
         .cols = cols,
         .rows = rows,
-        .max_scrollback = max_scrollback,
+        .max_scrollback_bytes = max_scrollback,
+        .max_scrollback_lines = null,
         .colors = .{
             .background = .init(.{
                 .r = @truncate(background_rgb >> 16),
@@ -282,14 +321,20 @@ export fn init(
         allocator.destroy(state);
         return 0;
     };
-    state.responses = .{};
+    state.effects = .{};
     state.synchronized_output_generation = 0;
-    state.stream = .initAlloc(allocator, .init(
-        &state.terminal,
-        &state.responses,
-        &state.synchronized_output_generation,
-    ));
+    state.stream = .init(.{
+        .allocator = allocator,
+        .continuation_max_bytes = CONTINUATION_MAX_BYTES,
+        .handler = .init(
+            &state.terminal,
+            &state.effects,
+            &state.synchronized_output_generation,
+            effects_mode != 0,
+        ),
+    });
     state.render = RenderState.empty;
+    state.output = &.{};
     return @intFromPtr(state);
 }
 
@@ -298,26 +343,183 @@ export fn deinit(ptr: usize) void {
     state.render.deinit(allocator);
     state.stream.deinit();
     state.terminal.deinit(allocator);
+    if (state.output.len > 0) allocator.free(state.output);
     allocator.destroy(state);
 }
 
-export fn resize(ptr: usize, cols: u16, rows: u16) void {
+export fn resize(ptr: usize, cols: u16, rows: u16, width_px: u32, height_px: u32) u32 {
     const state = stateFromPtr(ptr);
-    state.terminal.resize(allocator, cols, rows) catch {};
+    if (cols == 0 or rows == 0) return MUTATION_RESIZE_FAILURE;
+    const dropped_before = state.effects.dropped_frames;
+    const cell_size: @FieldType(Terminal.Resize, "cell_size_px") = if (width_px > 0 and height_px > 0) .{
+        .width = @max(1, width_px / cols),
+        .height = @max(1, height_px / rows),
+    } else null;
+    state.stream.handler.inner.resize(.{
+        .cols = cols,
+        .rows = rows,
+        .cell_size_px = cell_size,
+    }) catch return MUTATION_RESIZE_FAILURE;
+    if (state.effects.dropped_frames != dropped_before) return MUTATION_EFFECT_OVERFLOW;
+    return MUTATION_OK;
 }
 
 // -- Data input -------------------------------------------------
 
-export fn write(ptr: usize, data_ptr: [*]const u8, data_len: u32) void {
+export fn write(ptr: usize, data_ptr: [*]const u8, data_len: u32) u32 {
     const state = stateFromPtr(ptr);
-    state.stream.nextSlice(data_ptr[0..data_len]) catch {};
+    const dropped_before = state.effects.dropped_frames;
+    state.stream.nextSlice(data_ptr[0..data_len]);
+    if (state.stream.handler.inner.semantic_failure) return MUTATION_SEMANTIC_FAILURE;
+    if (state.effects.dropped_frames != dropped_before) return MUTATION_EFFECT_OVERFLOW;
+    return MUTATION_OK;
+}
+
+// -- Engine and checkpoint data --------------------------------
+
+export fn build_id_ptr() usize {
+    return @intFromPtr(BUILD_ID.ptr);
+}
+
+export fn build_id_len() u32 {
+    return BUILD_ID.len;
+}
+
+export fn output_ptr(ptr: usize) usize {
+    const output = stateFromPtr(ptr).output;
+    return if (output.len == 0) 0 else @intFromPtr(output.ptr);
+}
+
+export fn output_len(ptr: usize) u32 {
+    return @intCast(stateFromPtr(ptr).output.len);
+}
+
+export fn clear_output(ptr: usize) void {
+    replaceOutput(stateFromPtr(ptr), &.{});
+}
+
+/// Export the exact parser continuation retained by TerminalStream. A zero
+/// length is a valid ground continuation; OUTPUT_ERROR reports unavailable
+/// tracking or allocation failure.
+export fn export_continuation(ptr: usize) u32 {
+    const state = stateFromPtr(ptr);
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    if (!writeContinuation(state, &writer.writer)) return OUTPUT_ERROR;
+    return finishOutput(state, &writer);
+}
+
+/// Encode one complete Ghostty snapshot synchronously. JS copies the output
+/// immediately from output_ptr/output_len before allowing another mutation.
+export fn encode_snapshot(ptr: usize) u32 {
+    const state = stateFromPtr(ptr);
+
+    var continuation: std.Io.Writer.Allocating = .init(allocator);
+    defer continuation.deinit();
+    if (!writeContinuation(state, &continuation.writer)) return OUTPUT_ERROR;
+
+    var snapshot: std.Io.Writer.Allocating = .init(allocator);
+    defer snapshot.deinit();
+    vt.snapshot.encode(
+        allocator,
+        &snapshot.writer,
+        &state.terminal,
+        .{ .continuation = if (continuation.written().len == 0)
+            .ground
+        else
+            .{ .bytes = continuation.written() } },
+    ) catch return OUTPUT_ERROR;
+    return finishOutput(state, &snapshot);
+}
+
+// -- Semantic input encoding -----------------------------------
+
+export fn encode_key(
+    ptr: usize,
+    key_ptr: [*]const u8,
+    key_len: u32,
+    text_ptr: [*]const u8,
+    text_len: u32,
+    modifiers: u16,
+    consumed_modifiers: u16,
+    action_raw: u32,
+    composing: u32,
+    unshifted_codepoint: u32,
+) u32 {
+    const state = stateFromPtr(ptr);
+    if (action_raw > @intFromEnum(vt.input.KeyAction.repeat) or
+        (unshifted_codepoint != 0 and !isUnicodeScalar(unshifted_codepoint)))
+    {
+        return OUTPUT_ERROR;
+    }
+
+    const key = std.meta.stringToEnum(
+        vt.input.Key,
+        key_ptr[0..key_len],
+    ) orelse .unidentified;
+    const unshifted: u21 = if (unshifted_codepoint > 0)
+        @intCast(unshifted_codepoint)
+    else
+        key.codepoint() orelse 0;
+    const event: vt.input.KeyEvent = .{
+        .action = @enumFromInt(action_raw),
+        .key = key,
+        .mods = @bitCast(modifiers),
+        .consumed_mods = @bitCast(consumed_modifiers),
+        .composing = composing != 0,
+        .utf8 = text_ptr[0..text_len],
+        .unshifted_codepoint = unshifted,
+    };
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    vt.input.encodeKey(
+        &writer.writer,
+        event,
+        .fromTerminal(&state.terminal),
+    ) catch return OUTPUT_ERROR;
+    return finishOutput(state, &writer);
+}
+
+export fn encode_paste(
+    ptr: usize,
+    data_ptr: [*]const u8,
+    data_len: u32,
+) u32 {
+    if (data_len > PASTE_MAX_BYTES) return OUTPUT_ERROR;
+    const state = stateFromPtr(ptr);
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    vt.input.encodePasteWriter(
+        &writer.writer,
+        data_ptr[0..data_len],
+        .fromTerminal(&state.terminal),
+    ) catch return OUTPUT_ERROR;
+    return finishOutput(state, &writer);
+}
+
+export fn encode_focus(ptr: usize, gained: u32) u32 {
+    const state = stateFromPtr(ptr);
+    if (!state.terminal.modes.get(.focus_event)) {
+        replaceOutput(state, &.{});
+        return 0;
+    }
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    vt.input.encodeFocus(
+        &writer.writer,
+        if (gained != 0) .gained else .lost,
+    ) catch return OUTPUT_ERROR;
+    return finishOutput(state, &writer);
 }
 
 // -- Render state -----------------------------------------------
 
-export fn update(ptr: usize) void {
+export fn update(ptr: usize) u32 {
     const state = stateFromPtr(ptr);
-    state.render.update(allocator, &state.terminal) catch {};
+    state.render.update(allocator, &state.terminal) catch return RENDER_FAILURE;
+    return RENDER_OK;
 }
 
 fn packFlags(style: Style) u8 {
@@ -367,7 +569,7 @@ fn encodeCell(
     out: *[CELL_BYTES]u8,
 ) void {
     const cp: u32 = switch (raw.content_tag) {
-        .codepoint, .codepoint_grapheme => raw.content.codepoint,
+        .codepoint, .codepoint_grapheme => raw.codepoint(),
         else => 0,
     };
 
@@ -378,7 +580,7 @@ fn encodeCell(
 
     const fg = if (has_fg) resolveRgb(style.fg_color, palette) else color.RGB{};
     const bg = if (has_bg_cell) switch (raw.content_tag) {
-        .bg_color_palette => palette[raw.content.color_palette],
+        .bg_color_palette => palette[raw.content.color_palette.data],
         .bg_color_rgb => blk: {
             const c = raw.content.color_rgb;
             break :blk color.RGB{ .r = c.r, .g = c.g, .b = c.b };
@@ -404,11 +606,13 @@ fn encodeCell(
 
 /// Write the entire viewport into a JS-provided flat buffer.
 /// Returns the number of cells written (rows * cols).
-export fn get_viewport(ptr: usize, buf_ptr: [*]u8) u32 {
+export fn get_viewport(ptr: usize, buf_ptr: [*]u8, max_cells: u32) u32 {
     const state = stateFromPtr(ptr);
     const rs = &state.render;
     const rows = rs.rows;
     const cols = rs.cols;
+    const required_cells = @as(u32, rows) * @as(u32, cols);
+    if (required_cells > max_cells) return OUTPUT_ERROR;
     const palette = &rs.colors.palette;
 
     const row_cells_slice = rs.row_data.items(.cells);
@@ -439,7 +643,7 @@ export fn get_viewport(ptr: usize, buf_ptr: [*]u8) u32 {
             const style: Style = if (raw.style_id != 0) style_cells[x] else .{};
 
             const cp: u32 = switch (raw.content_tag) {
-                .codepoint, .codepoint_grapheme => raw.content.codepoint,
+                .codepoint, .codepoint_grapheme => raw.codepoint(),
                 else => 0,
             };
 
@@ -450,7 +654,7 @@ export fn get_viewport(ptr: usize, buf_ptr: [*]u8) u32 {
 
             const fg = if (has_fg) resolveRgb(style.fg_color, palette) else color.RGB{};
             const bg = if (has_bg_cell) switch (raw.content_tag) {
-                .bg_color_palette => palette[raw.content.color_palette],
+                .bg_color_palette => palette[raw.content.color_palette.data],
                 .bg_color_rgb => blk: {
                     const c = raw.content.color_rgb;
                     break :blk color.RGB{ .r = c.r, .g = c.g, .b = c.b };
@@ -481,7 +685,7 @@ export fn get_viewport(ptr: usize, buf_ptr: [*]u8) u32 {
         }
     }
 
-    return @as(u32, rows) * @as(u32, cols);
+    return required_cells;
 }
 
 fn encodeGrapheme(
@@ -526,7 +730,7 @@ export fn get_viewport_grapheme(
     const raw = cells.items(.raw);
     if (col >= raw.len or raw[col].content_tag != .codepoint_grapheme) return 0;
     return encodeGrapheme(
-        raw[col].content.codepoint,
+        raw[col].codepoint(),
         cells.items(.grapheme)[col],
         buf_ptr,
         buf_len,
@@ -541,7 +745,7 @@ fn encodeHyperlink(
 ) u32 {
     const cells = pin.cells(.all);
     if (col >= cells.len or !cells[col].hyperlink) return 0;
-    const page = &pin.node.data;
+    const page = pin.node.page();
     const link_id = page.lookupHyperlink(&cells[col]) orelse return 0;
     const entry = page.hyperlink_set.get(page.memory, link_id);
     const uri = entry.uri.slice(page.memory);
@@ -691,18 +895,9 @@ export fn get_rows(ptr: usize) u32 {
 export fn get_scrollback_count(ptr: usize) u32 {
     const state = stateFromPtr(ptr);
     const screen: *Screen = state.terminal.screens.active;
-    var total: usize = 0;
-    var node_ = screen.pages.pages.first;
-    while (node_) |node| : (node_ = node.next) {
-        total += node.data.size.rows;
-    }
+    const total = screen.pages.total_rows;
     if (total <= state.terminal.rows) return 0;
     return @intCast(total - state.terminal.rows);
-}
-
-export fn get_scrollback_discarded_count(ptr: usize) u32 {
-    const state = stateFromPtr(ptr);
-    return @intCast(state.terminal.screens.active.pages.discardedRows());
 }
 
 /// Write one scrollback row into a JS-provided buffer, using the same cell
@@ -755,7 +950,7 @@ export fn get_scrollback_grapheme(
     const cells = pin.cells(.all);
     if (col >= cells.len or cells[col].content_tag != .codepoint_grapheme) return 0;
     return encodeGrapheme(
-        cells[col].content.codepoint,
+        cells[col].codepoint(),
         pin.grapheme(&cells[col]) orelse return 0,
         buf_ptr,
         buf_len,
@@ -776,11 +971,27 @@ export fn get_scrollback_hyperlink(
     return encodeHyperlink(pin, col, buf_ptr, buf_len);
 }
 
-// -- Responses --------------------------------------------------
+// -- PTY effects ------------------------------------------------
 
+export fn next_effect_len(ptr: usize) u32 {
+    return stateFromPtr(ptr).effects.peekLen();
+}
+
+export fn read_effect(ptr: usize, buf_ptr: [*]u8, buf_len: u32) u32 {
+    return stateFromPtr(ptr).effects.pop(buf_ptr[0..buf_len]);
+}
+
+export fn dropped_effect_frames(ptr: usize) u32 {
+    return stateFromPtr(ptr).effects.dropped_frames;
+}
+
+export fn dropped_effect_bytes(ptr: usize) u32 {
+    return stateFromPtr(ptr).effects.dropped_bytes;
+}
+
+/// Compatibility alias for TerminalCore.getResponse().
 export fn read_response(ptr: usize, buf_ptr: [*]u8, buf_len: u32) u32 {
-    const state = stateFromPtr(ptr);
-    return state.responses.pop(buf_ptr[0..buf_len]);
+    return read_effect(ptr, buf_ptr, buf_len);
 }
 
 // -- Memory management ------------------------------------------

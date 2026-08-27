@@ -55,7 +55,54 @@ describe("GhosttyCore terminal responses", () => {
   it("answers primary device attributes", async () => {
     const core = await newCore();
     core.writeString("\x1b[c");
-    expect(drain(core)).toEqual(["\x1b[?1;2c"]);
+    expect(drain(core)).toEqual(["\x1b[?62;22c"]);
+  });
+
+  it("uses one fixed authority profile for terminal capability queries", async () => {
+    const authority = await newCore();
+    authority.resize(20, 4, 200, 80);
+    const queries =
+      "\x1b[c" +
+      "\x1b[>c" +
+      "\x1b[=c" +
+      "\x1b[5n" +
+      "\x1b[6n" +
+      "\x1b[?2026$p" +
+      "\x1b[14t" +
+      "\x1b[16t" +
+      "\x1b[18t" +
+      "\x1b[>q" +
+      "\x1b[?996n" +
+      "\x1b]10;?\x1b\\" +
+      "\x1b]11;?\x1b\\" +
+      "\x1bP+q524742\x1b\\" +
+      "\x1bP+q544E\x1b\\" +
+      "\x1b[?u";
+
+    authority.writeString(queries);
+    expect(drain(authority)).toEqual([
+      "\x1b[?62;22c",
+      "\x1b[>1;0;0c",
+      "\x1bP!|00000000\x1b\\",
+      "\x1b[0n",
+      "\x1b[1;1R",
+      "\x1b[?2026;2$y",
+      "\x1b[4;80;200t",
+      "\x1b[6;20;10t",
+      "\x1b[8;4;20t",
+      "\x1bP>|wterm 0.3.4\x1b\\",
+      "\x1b[?997;1n",
+      "\x1b]10;rgb:d4d4/d4d4/d4d4\x1b\\",
+      "\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\",
+      "\x1bP1+r524742=38\x1b\\",
+      "\x1bP1+r544E=787465726D2D323536636F6C6F72\x1b\\",
+      "\x1b[?0u",
+    ]);
+
+    const replica = await newCore(20, 4, { effects: "discard" });
+    replica.resize(20, 4, 200, 80);
+    replica.writeString(queries);
+    expect(drain(replica)).toEqual([]);
   });
 
   it("reports a mode from the same state the set path writes", async () => {
@@ -95,16 +142,12 @@ describe("GhosttyCore terminal responses", () => {
     expect(core.synchronizedOutputGeneration?.()).toBe(3);
   });
 
-  it("says nothing to an ANSI-mode DECRQM, which ghostty 1.3.1 never dispatches", async () => {
-    // `CSI Ps $ p` carries one intermediate. ghostty's stream switches on
-    // `intermediates.len == 2` before testing for the ANSI form, so the ANSI
-    // branch inside is unreachable and no action reaches any handler. The
-    // handler unpacks the mode tag anyway, so it stays correct if that outer
-    // switch ever widens; this test is what would notice the upgrade.
+  it("answers known and unknown ANSI-mode DECRQM queries", async () => {
     const core = await newCore();
     core.writeString("\x1b[4$p");
+    core.writeString("\x1b[4h\x1b[4$p");
     core.writeString("\x1b[7777$p");
-    expect(drain(core)).toEqual([]);
+    expect(drain(core)).toEqual(["\x1b[4;2$y", "\x1b[4;1$y", "\x1b[7777;0$y"]);
   });
 
   it("reports an unrecognized mode as not recognized", async () => {
@@ -138,6 +181,26 @@ describe("GhosttyCore terminal responses", () => {
     ]);
   });
 
+  it("answers cell and pixel geometry from the authoritative resize", async () => {
+    const core = await newCore(20, 4);
+    core.resize(20, 4, 200, 80);
+    core.writeString("\x1b[14t\x1b[16t\x1b[18t");
+
+    expect(drain(core)).toEqual([
+      "\x1b[4;80;200t",
+      "\x1b[6;20;10t",
+      "\x1b[8;4;20t",
+    ]);
+  });
+
+  it("queues in-band size reports after resize returns", async () => {
+    const core = await newCore(20, 4);
+    core.writeString("\x1b[?2048h");
+    core.resize(30, 5, 300, 100);
+
+    expect(drain(core)).toEqual(["\x1b[48;4;20;0;0t", "\x1b[48;5;30;100;300t"]);
+  });
+
   it("rejects invalid configured colors", async () => {
     await expect(
       GhosttyCore.load({
@@ -152,7 +215,7 @@ describe("GhosttyCore terminal responses", () => {
   it("keeps replies in the order the queries arrived", async () => {
     const core = await newCore();
     core.writeString("\x1b[c\x1b[6n\x1b[5n");
-    expect(drain(core)).toEqual(["\x1b[?1;2c", "\x1b[1;1R", "\x1b[0n"]);
+    expect(drain(core)).toEqual(["\x1b[?62;22c", "\x1b[1;1R", "\x1b[0n"]);
   });
 
   it("still applies the state changes the readonly handler owned", async () => {
