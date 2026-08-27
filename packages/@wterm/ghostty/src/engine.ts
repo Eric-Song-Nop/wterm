@@ -8,7 +8,7 @@ export const GHOSTTY_ENGINE_PROVENANCE = Object.freeze({
   buildSourceSha256:
     "1b7f9ea163c4345c191d01a1d6f1fb0a0f873a39241cfa35b86ec94c362e9d95",
   committedWasmSha256:
-    "d381e9c523b7f7efdf8e586327a60ffb5cdad36907b9eae18dfcac701f65bb82",
+    "6d817a66a606e88ec3c0cefa9ab26f042b285577095588b6569d62838718edc5",
   dependencyManifestSha256:
     "75261ca43a5c50dd88c5b55577cf1db28196e28f374ac6d52766264e8de26bf4",
   ghosttyCommit: "fe317f850c3ab212f6638122c459b9b48b99a016",
@@ -20,7 +20,7 @@ export const GHOSTTY_ENGINE_PROVENANCE = Object.freeze({
   ghosttyUpstreamBaseCommit: "f2d5758f6305867dc36b36293c6165d8152b853e",
   ghosttyVtFeatures: "default",
   manifestGeneratorSha256:
-    "5366ec10ebcc6e664cace07fe9bad72f2a3b3bb7970f7fe71d34cd6d2739d076",
+    "69c4f240cdad64a389353f3a93e4fdec6a4d4a7e9bfba8d49285b44b7c42f75f",
   optimize: "ReleaseSmall",
   patches: [
     {
@@ -28,11 +28,10 @@ export const GHOSTTY_ENGINE_PROVENANCE = Object.freeze({
       commit: "fe317f850c3ab212f6638122c459b9b48b99a016",
       id: "ansi-decrqm-dispatch",
       repository: "Eric-Song-Nop/ghostty",
-      upstreamPullRequest: "https://github.com/ghostty-org/ghostty/pull/14044",
     },
   ],
   patchsetSha256:
-    "fdaf6f454921658575f63a7c48495af10344bced869366ceb46500caf3cc3a09",
+    "0bff825b43eb7e3e8850b0b1588822558c685449a5215201acccb7b0d12cd9e2",
   snapshotSchemaSha256:
     "de359f274c5492378c40c571d5b17a383d2863b829fe6e15e8d00ebc146f6be9",
   snapshotSchemaVersion: 1,
@@ -48,13 +47,13 @@ export const GHOSTTY_ENGINE_PROVENANCE = Object.freeze({
 } as const);
 
 export const GHOSTTY_BUILD_ID =
-  "ghostty:fe317f850c3ab212f6638122c459b9b48b99a016:wterm-build-sha256:400343404fe750828306ff76908630e2d445daebbf7147f3fac773b96ff9b2f3";
+  "ghostty:fe317f850c3ab212f6638122c459b9b48b99a016:wterm-build-sha256:88bf0b0fa586733f84df70d11de24313d76a0e7c25af6d72582ddc36de68020b";
 
 export const GHOSTTY_ENGINE_ID =
-  "ghostty:fe317f850c3ab212f6638122c459b9b48b99a016:wterm-engine-sha256:3e815bf0130f67df67da5b780505fbb43a9ea808f3dd379c50aa0d7dd0aeadbe";
+  "ghostty:fe317f850c3ab212f6638122c459b9b48b99a016:wterm-engine-sha256:2836a71302115fb2989235666560fc4b6a5739158478e85e4d25bd1f1248fe96";
 
 export const GHOSTTY_WASM_SHA256 =
-  "d381e9c523b7f7efdf8e586327a60ffb5cdad36907b9eae18dfcac701f65bb82";
+  "6d817a66a606e88ec3c0cefa9ab26f042b285577095588b6569d62838718edc5";
 
 export const GHOSTTY_TERMINAL_PROFILE =
   GHOSTTY_ENGINE_PROVENANCE.terminalProfile;
