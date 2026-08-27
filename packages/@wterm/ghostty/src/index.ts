@@ -19,9 +19,17 @@ export {
   GHOSTTY_WASM_SHA256,
 } from "./engine.js";
 export type { GhosttyEngineManifest } from "./engine.js";
-export {
-  GhosttyMutationError,
-  GhosttyRenderError,
-  GhosttyRuntime,
-} from "./wasm-bindings.js";
+export { GhosttyMutationError, GhosttyRenderError } from "./wasm-bindings.js";
 export type { GhosttyWasmSource } from "./wasm-bindings.js";
+export {
+  GhosttyPassiveRestore,
+  GhosttyRestoreError,
+  GhosttyRuntime,
+} from "./ghostty-runtime.js";
+export type {
+  GhosttyAdvanceRestoreOptions,
+  GhosttyPassiveRestoreOptions,
+  GhosttyRestoreHistoryProgress,
+  GhosttyRestorePhase,
+  GhosttyRestoreStatus,
+} from "./ghostty-runtime.js";

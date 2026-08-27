@@ -6,13 +6,7 @@
  * This module handles WASM loading, memory management, and cell parsing.
  */
 
-import {
-  GHOSTTY_BUILD_ID,
-  GHOSTTY_ENGINE_ID,
-  GHOSTTY_ENGINE_MANIFEST,
-  GHOSTTY_WASM_SHA256,
-  type GhosttyEngineManifest,
-} from "./engine.js";
+import { GHOSTTY_BUILD_ID, GHOSTTY_WASM_SHA256 } from "./engine.js";
 
 export interface GhosttyExports {
   memory: WebAssembly.Memory;
@@ -46,6 +40,30 @@ export interface GhosttyExports {
   clear_output(ptr: number): void;
   export_continuation(ptr: number): number;
   encode_snapshot(ptr: number): number;
+
+  // Passive snapshot restore
+  restore_begin(
+    data_ptr: number,
+    data_len: number,
+    max_continuation_bytes: number,
+  ): number;
+  restore_phase(ptr: number): number;
+  restore_status(ptr: number): number;
+  restore_next_history(ptr: number): number;
+  restore_progress_screen(ptr: number): number;
+  restore_progress_rows(ptr: number): number;
+  restore_progress_remaining(ptr: number): number;
+  restore_abandon_history(ptr: number): number;
+  restore_write(ptr: number, data_ptr: number, data_len: number): number;
+  restore_resize(
+    ptr: number,
+    cols: number,
+    rows: number,
+    width_px: number,
+    height_px: number,
+  ): number;
+  restore_take_state(ptr: number): number;
+  restore_deinit(ptr: number): void;
 
   // Semantic input encoding
   encode_key(
@@ -104,6 +122,8 @@ export interface GhosttyExports {
   // Grid
   get_cols(ptr: number): number;
   get_rows(ptr: number): number;
+  terminal_cols(ptr: number): number;
+  terminal_rows(ptr: number): number;
 
   // Scrollback
   get_scrollback_count(ptr: number): number;
@@ -138,6 +158,9 @@ export interface GhosttyExports {
   // Memory
   alloc_buffer(len: number): number;
   free_buffer(ptr: number, len: number): void;
+  live_restore_handles(): number;
+  live_terminal_states(): number;
+  live_bridge_buffers(): number;
 }
 
 export interface GhosttyWasm {
@@ -393,21 +416,6 @@ export async function loadGhosttyWasm(
     );
   }
   return { artifactVerified, exports, instance };
-}
-
-/** A loaded WASM instance shared by one or more terminal cores. */
-export class GhosttyRuntime {
-  readonly artifactVerified: boolean;
-  readonly engineId = GHOSTTY_ENGINE_ID;
-  readonly manifest: GhosttyEngineManifest = GHOSTTY_ENGINE_MANIFEST;
-
-  private constructor(readonly wasm: GhosttyWasm) {
-    this.artifactVerified = wasm.artifactVerified;
-  }
-
-  static async load(source?: GhosttyWasmSource): Promise<GhosttyRuntime> {
-    return new GhosttyRuntime(await loadGhosttyWasm(source));
-  }
 }
 
 /** Parsed cell data from the viewport buffer. */

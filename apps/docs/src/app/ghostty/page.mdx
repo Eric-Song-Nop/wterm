@@ -229,6 +229,23 @@ The authority can encode semantic key, paste, and focus input with `encodeKey()`
 
 `encodeSnapshot()` returns a point-in-time Ghostty binary checkpoint, including any unfinished parser continuation available through `getContinuation()`. A snapshot is not an ordered event protocol; the ordered PTY byte stream remains authoritative between checkpoints.
 
+Passive replicas restore the READY prefix synchronously and decode one history PAGE at a time. `advanceToFinish()` yields between pages by default and accepts an `AbortSignal`; cancellation explicitly abandons remaining history while preserving the READY terminal. Apply transport bytes only after FINISH or `abandonHistory()`, then transfer ownership once with `takeCore()`:
+
+```ts
+const restore = runtime.beginPassiveRestore(snapshot, {
+  effects: "discard",
+  maxContinuationBytes: 64 * 1024,
+});
+await restore.advanceToFinish({ signal });
+restore.writeRaw(bytesAfterCheckpoint);
+const replica = restore.takeCore();
+restore.dispose();
+```
+
+Restore handles and transferred cores are permanently effect-discarding. They cannot produce PTY replies while replaying a parser continuation, decoding history, or applying later output.
+
+FINISH also validates that the bounded snapshot buffer ends exactly there; trailing bytes and concatenated snapshots are rejected. `abandonHistory()` is the explicit integrity opt-out and discards all remaining snapshot bytes. If a WASM call traps, the handle clears its native pointer, attempts best-effort cleanup, and permanently throws one fatal `GhosttyRestoreError` with `status: "unknown"`; callers must not retry or call `takeCore()`.
+
 ## How it works
 
 `@wterm/ghostty` builds libghostty directly from the auditable [Eric-Song-Nop/ghostty fork](https://github.com/Eric-Song-Nop/ghostty) — no build-time source rewriting, third-party npm packages, or pre-built binaries from other projects. The architecture:
