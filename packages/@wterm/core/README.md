@@ -50,6 +50,7 @@ bridge.writeString("Hello, world!\r\n");
 
 const cell = bridge.getCell(0, 0); // { char, chars?, fg, bg, flags, width, linkUri?, linkId?, linkKey? }
 const cursor = bridge.getCursor();  // { row, col, visible }
+bridge.dispose();
 ```
 
 | Method | Description |
@@ -59,6 +60,7 @@ const cursor = bridge.getCursor();  // { row, col, visible }
 | `writeString(str, afterChunk?)` | Write a UTF-8 string, optionally running a callback after each internal chunk |
 | `writeRaw(data, afterChunk?)` | Write raw bytes, optionally running a callback after each internal chunk |
 | `resize(cols, rows)` | Resize the terminal grid |
+| `dispose()` | Idempotently release the core. The instance cannot be reused afterward. |
 | `getCell(row, col)` | Get cell data, including optional resolved OSC 8 metadata (`linkUri`, explicit `linkId`, and opaque `linkKey`) |
 | `getCursor()` | Get cursor state (`{ row, col, visible }`) |
 | `getCols()` / `getRows()` | Get current grid dimensions |
@@ -79,6 +81,8 @@ const cursor = bridge.getCursor();  // { row, col, visible }
 | `focusEvents()` | Whether focus reporting is active |
 | `synchronizedOutput()` | Whether synchronized output mode (2026) is active |
 | `synchronizedOutputGeneration()` | Monotonic generation for synchronized output blocks |
+
+Every `TerminalCore` implementation must provide a non-throwing, idempotent `dispose()` method. `WTerm` owns a core passed to its constructor and disposes it on replacement or destruction.
 
 OSC 8 hyperlink metadata is optional so third-party `TerminalCore` implementations remain source-compatible. Cores should expose the resolved URI and an opaque semantic key rather than a private numeric index.
 

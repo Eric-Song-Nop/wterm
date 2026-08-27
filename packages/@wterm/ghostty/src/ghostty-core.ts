@@ -94,6 +94,7 @@ export class GhosttyCore implements TerminalCore {
   private _options: GhosttyOptions;
   private _foregroundRgb: number;
   private _backgroundRgb: number;
+  private _disposed = false;
 
   private _viewportBufPtr = 0;
   private _viewportBufSize = 0;
@@ -139,6 +140,12 @@ export class GhosttyCore implements TerminalCore {
   // -- Lifecycle --
 
   init(cols: number, rows: number): void {
+    if (this._disposed) {
+      throw new Error("@wterm/ghostty: cannot initialize a disposed core");
+    }
+    if (this.termPtr !== 0) {
+      throw new Error("@wterm/ghostty: core is already initialized");
+    }
     this._cols = cols;
     this._rows = rows;
     const scrollback = this._options.scrollbackLimit ?? 10000;
@@ -157,6 +164,65 @@ export class GhosttyCore implements TerminalCore {
     this._hyperlinkBufPtr = allocBuffer(this.wasm, HYPERLINK_BUFFER_BYTES);
     this._allocViewportBuffer();
     this._invalidate();
+  }
+
+  dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
+
+    const release = (cleanup: () => void): void => {
+      try {
+        cleanup();
+      } catch {
+        // Disposal is best-effort so one WASM trap cannot leak other resources.
+      }
+    };
+
+    try {
+      if (this._viewportBufPtr !== 0) {
+        release(() =>
+          freeBuffer(this.wasm, this._viewportBufPtr, this._viewportBufSize),
+        );
+      }
+      if (this._scrollbackBufPtr !== 0) {
+        release(() =>
+          freeBuffer(
+            this.wasm,
+            this._scrollbackBufPtr,
+            this._scrollbackBufSize,
+          ),
+        );
+      }
+      if (this._graphemeBufPtr !== 0) {
+        release(() =>
+          freeBuffer(this.wasm, this._graphemeBufPtr, this._graphemeBufSize),
+        );
+      }
+      if (this._hyperlinkBufPtr !== 0) {
+        release(() =>
+          freeBuffer(this.wasm, this._hyperlinkBufPtr, this._hyperlinkBufSize),
+        );
+      }
+      if (this.termPtr !== 0) {
+        release(() => this.wasm.exports.deinit(this.termPtr));
+      }
+    } finally {
+      this.termPtr = 0;
+      this._viewportBufPtr = 0;
+      this._viewportBufSize = 0;
+      this._viewportView = null;
+      this._scrollbackBufPtr = 0;
+      this._scrollbackBufSize = 0;
+      this._scrollbackView = null;
+      this._scrollbackOffset = -1;
+      this._scrollbackLen = 0;
+      this._graphemeBufPtr = 0;
+      this._graphemeBufSize = 0;
+      this._hyperlinkBufPtr = 0;
+      this._hyperlinkBufSize = 0;
+      this._cols = 0;
+      this._rows = 0;
+    }
   }
 
   resize(cols: number, rows: number): void {

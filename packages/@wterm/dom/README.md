@@ -42,6 +42,7 @@ new WTerm(element: HTMLElement, options?: WTermOptions)
 |---|---|---|---|
 | `cols` | `number` | `80` | Initial column count |
 | `rows` | `number` | `24` | Initial row count |
+| `core` | `TerminalCore` | — | Pre-constructed core owned and disposed by WTerm |
 | `wasmUrl` | `string` | — | Optional URL to serve the WASM binary separately (embedded by default) |
 | `autoResize` | `boolean` | `true` | Auto-resize based on container dimensions |
 | `cursorBlink` | `boolean` | `false` | Enable cursor blinking animation |
@@ -57,8 +58,11 @@ new WTerm(element: HTMLElement, options?: WTermOptions)
 | `init(): Promise<WTerm>` | Load WASM and start rendering |
 | `write(data: string \| Uint8Array)` | Write data to the terminal |
 | `resize(cols, rows)` | Resize the terminal grid |
+| `adoptCore(core)` | Atomically replace the active core with an already initialized core |
 | `focus()` | Focus the terminal element |
-| `destroy()` | Clean up event listeners and DOM |
+| `destroy()` | Dispose the active core and clean up event listeners and DOM |
+
+`adoptCore()` stages the replacement core's first frame outside the live DOM. On success, WTerm takes ownership and disposes the previous core. If validation or rendering fails, the existing core and DOM remain active and the caller retains ownership of the replacement. Adoption does not call `init()`, `onData`, or `onResize`. A viewport following the bottom stays there; otherwise its distance from the bottom is preserved and clamped to the replacement's scroll range.
 
 When a terminal application enables modes 1000 or 1002 with SGR encoding (1006), pointer input is sent through `onData`. Focus reports are sent when mode 1004 is active.
 

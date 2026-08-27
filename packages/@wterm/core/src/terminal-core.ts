@@ -52,6 +52,11 @@ export interface TerminalCore {
   // -- Lifecycle --
   init(cols: number, rows: number): void;
   resize(cols: number, rows: number): void;
+  /**
+   * Release all resources owned by this core. Implementations must tolerate
+   * repeated calls and must not throw. The core cannot be reused afterward.
+   */
+  dispose(): void;
 
   // -- I/O --
   writeString(str: string, afterChunk?: () => void): void;

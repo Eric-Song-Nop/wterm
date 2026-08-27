@@ -13,6 +13,7 @@ export interface WTermOptions {
   /**
    * A pre-constructed terminal core. When provided, `wasmUrl` is ignored and
    * this core is used directly instead of loading the built-in Zig WASM binary.
+   * WTerm owns the core and disposes it when destroyed or replaced.
    */
   core?: TerminalCore;
   wasmUrl?: string;
@@ -32,7 +33,7 @@ export class WTerm {
   autoResize: boolean;
   debug: DebugAdapter | null = null;
 
-  private _coreOption: TerminalCore | undefined;
+  private _ownedCore: TerminalCore | null;
   private wasmUrl: string | undefined;
   private _debugEnabled: boolean;
   private renderer: Renderer | null = null;
@@ -44,6 +45,8 @@ export class WTerm {
   private _rendererNeedsSetup = false;
   private resizeObserver: ResizeObserver | null = null;
   private _destroyed = false;
+  private _initialized = false;
+  private _initializing = false;
   private _shouldScrollToBottom = false;
   private _scrollbackDiscardedCount = 0;
   private _programmaticScrollTop: number | null = null;
@@ -63,7 +66,7 @@ export class WTerm {
 
   constructor(element: HTMLElement, options: WTermOptions = {}) {
     this.element = element;
-    this._coreOption = options.core;
+    this._ownedCore = options.core ?? null;
     this.wasmUrl = options.wasmUrl;
     this.cols = options.cols || 80;
     this.rows = options.rows || 24;
@@ -144,14 +147,24 @@ export class WTerm {
   }
 
   async init(): Promise<this> {
+    if (this._destroyed) return this;
+    if (this._initialized || this._initializing) {
+      throw new Error("wterm: terminal is already initialized");
+    }
+    this._initializing = true;
+
     try {
-      if (this._coreOption) {
-        this.bridge = this._coreOption;
-      } else {
-        this.bridge = await WasmBridge.load(this.wasmUrl);
+      let core = this._ownedCore;
+      if (!core) {
+        core = await WasmBridge.load(this.wasmUrl);
+        if (this._destroyed) {
+          core.dispose();
+          return this;
+        }
+        this._ownedCore = core;
       }
-      if (this._destroyed) return this;
-      this.bridge.init(this.cols, this.rows);
+      this.bridge = core;
+      core.init(this.cols, this.rows);
 
       if (this._debugEnabled) {
         this.debug = new DebugAdapter();
@@ -190,11 +203,14 @@ export class WTerm {
 
       this.input.focus();
       this._initialRender();
+      this._initialized = true;
     } catch (err) {
       this.destroy();
       throw new Error(
         `wterm: failed to initialize: ${err instanceof Error ? err.message : err}`,
       );
+    } finally {
+      this._initializing = false;
     }
 
     return this;
@@ -244,6 +260,89 @@ export class WTerm {
     }
     drain();
     if (hasDeliveryError) throw deliveryError;
+  }
+
+  /**
+   * Replace the active core with an already initialized core. Ownership is
+   * transferred only after its first frame has rendered successfully.
+   */
+  adoptCore(core: TerminalCore): void {
+    const previousCore = this._ownedCore;
+    if (this._destroyed || !previousCore || !this.bridge || !this.renderer) {
+      throw new Error("wterm: cannot adopt a core before initialization");
+    }
+    if (core === previousCore) return;
+
+    const cols = core.getCols();
+    const rows = core.getRows();
+    if (
+      !Number.isInteger(cols) ||
+      cols <= 0 ||
+      !Number.isInteger(rows) ||
+      rows <= 0
+    ) {
+      throw new Error("wterm: adopted core must have positive grid dimensions");
+    }
+
+    const previousScrollTop = this.element.scrollTop;
+    const previousClientHeight = this.element.clientHeight;
+    const distanceFromBottom = Math.max(
+      0,
+      this.element.scrollHeight - previousClientHeight - previousScrollTop,
+    );
+    const wasAtBottom = distanceFromBottom < 5;
+    const rowHeight = this._rowHeight || 17;
+    const scrollbackCount = core.getScrollbackCount();
+    const discardedCount = core.getScrollbackDiscardedCount?.();
+    const estimatedMaxScrollTop = Math.max(
+      0,
+      (scrollbackCount + rows) * rowHeight - previousClientHeight,
+    );
+    const targetScrollTop = wasAtBottom
+      ? estimatedMaxScrollTop
+      : Math.max(0, estimatedMaxScrollTop - distanceFromBottom);
+
+    const nextContainer = document.createElement("div");
+    nextContainer.className = "term-grid";
+    const nextRenderer = new Renderer(nextContainer);
+    nextRenderer.setup(cols, rows);
+    nextRenderer.render(core, {
+      scrollTop: targetScrollTop,
+      clientHeight: previousClientHeight,
+      rowHeight,
+      scrollbackDiscardedCount: discardedCount,
+    });
+
+    this._cancelScheduledRender();
+    this._cancelSynchronizedOutputFallback();
+    this._container.replaceWith(nextContainer);
+    this._container = nextContainer;
+    this.renderer = nextRenderer;
+    this.bridge = core;
+    this._ownedCore = core;
+    this.cols = cols;
+    this.rows = rows;
+    this._synchronizedOutputState = "idle";
+    this._synchronizedOutputGeneration = 0;
+    this._rendererNeedsSetup = false;
+    this._scrollbackDiscardedCount = discardedCount ?? 0;
+    this._pendingResizeScrollTop = null;
+    this._programmaticScrollTop = null;
+    this._shouldScrollToBottom = wasAtBottom;
+    this.element.classList.toggle("has-scrollback", scrollbackCount > 0);
+    if (!this.autoResize) this._lockHeight();
+    const maxScrollTop = Math.max(
+      0,
+      this.element.scrollHeight - this.element.clientHeight,
+    );
+    this._setScrollTop(
+      wasAtBottom
+        ? maxScrollTop
+        : Math.max(0, maxScrollTop - distanceFromBottom),
+    );
+    this.debug?.setBridge(core);
+
+    previousCore.dispose();
   }
 
   resize(cols: number, rows: number): void {
@@ -531,7 +630,12 @@ export class WTerm {
   }
 
   destroy(): void {
+    if (this._destroyed) return;
     this._destroyed = true;
+    this._initialized = false;
+    const core = this._ownedCore;
+    this._ownedCore = null;
+    this.bridge = null;
     this._cancelScheduledRender();
     this._cancelSynchronizedOutputFallback();
     if (this.resizeObserver) this.resizeObserver.disconnect();
@@ -559,5 +663,6 @@ export class WTerm {
       delete (globalThis as Record<string, unknown>).__wterm;
     }
     this.debug = null;
+    core?.dispose();
   }
 }

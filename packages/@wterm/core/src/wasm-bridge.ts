@@ -74,6 +74,7 @@ export class WasmBridge implements TerminalCore {
   private decoder = new TextDecoder();
   private _dv!: DataView;
   private _dvBuffer: ArrayBuffer | null = null;
+  private _disposed = false;
   private linkCache = new Map<
     number,
     { linkUri: string; linkId?: string; linkKey: string }
@@ -110,9 +111,22 @@ export class WasmBridge implements TerminalCore {
   }
 
   init(cols: number, rows: number): void {
+    if (this._disposed) {
+      throw new Error("[wterm] Cannot initialize a disposed core");
+    }
     this.exports.init(cols, rows);
     this.linkCache.clear();
     this._updatePointers();
+  }
+
+  dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
+    this.gridPtr = 0;
+    this.dirtyPtr = 0;
+    this.writeBufferPtr = 0;
+    this._dvBuffer = null;
+    this.linkCache.clear();
   }
 
   private _updatePointers(): void {

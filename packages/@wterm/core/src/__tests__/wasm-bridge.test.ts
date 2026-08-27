@@ -27,6 +27,15 @@ describe("WasmBridge", () => {
       expect(bridge.getCols()).toBe(80);
       expect(bridge.getRows()).toBe(24);
     });
+
+    it("can be disposed repeatedly but not initialized again", () => {
+      bridge.dispose();
+      bridge.dispose();
+
+      expect(() => bridge.init(80, 24)).toThrow(
+        "[wterm] Cannot initialize a disposed core",
+      );
+    });
   });
 
   describe("writeString / getCell", () => {

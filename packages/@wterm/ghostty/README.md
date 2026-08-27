@@ -30,6 +30,8 @@ const term = new WTerm(document.getElementById("terminal"), { core });
 await term.init();
 ```
 
+`WTerm` owns the core above and calls its idempotent `dispose()` method on replacement or destruction. Code that uses `GhosttyCore` without `WTerm` must call `dispose()` itself to release the libghostty terminal and WASM bridge buffers.
+
 ### React
 
 ```tsx
