@@ -43,9 +43,17 @@ function onData(chunk: string) {
 </template>
 ```
 
+Remote authorities should receive semantic intent instead:
+
+```vue
+<Terminal :input-sink="{ send: (event) => session.sendInput(event) }" />
+```
+
+`inputSink` and the `data` listener are mutually exclusive at runtime. With `inputSink`, auto-resize emits a resize request without local replica reflow; apply accepted authority geometry through the exposed `resize(cols, rows, widthPx, heightPx)` method.
+
 ## Props
 
-The `<Terminal>` component accepts all [shared terminal options](/api-reference#terminal-options) (`cols`, `rows`, `core`, `wasmUrl`, `autoResize`, `cursorBlink`) plus [Vue-only props](/api-reference#vue-only-props) (`theme`). Pass a [`TerminalCore`](/ghostty) instance to the `core` prop to use an alternative emulation backend.
+The `<Terminal>` component accepts all [shared terminal options](/api-reference#terminal-options) (`cols`, `rows`, `core`, `wasmUrl`, `autoResize`, `cursorBlink`, `inputSink`) plus [Vue-only props](/api-reference#vue-only-props) (`theme`). Pass a [`TerminalCore`](/ghostty) instance to the `core` prop to use an alternative emulation backend.
 
 Because `inheritAttrs` is enabled, standard DOM attributes (`class`, `style`, `id`, ARIA props, etc.) are forwarded to the root `<div>`.
 

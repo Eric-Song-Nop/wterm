@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, act } from "@testing-library/react";
 import React, { createRef } from "react";
-import type { TerminalHandle } from "../Terminal.js";
+import type { TerminalHandle, TerminalProps } from "../Terminal.js";
 import { useTerminal } from "../useTerminal.js";
 
 let lastWTermInstance: any = null;
@@ -17,6 +17,7 @@ vi.mock("@wterm/dom", () => {
     this.cols = options?.cols ?? 80;
     this.rows = options?.rows ?? 24;
     this.onData = options?.onData ?? null;
+    this.inputSink = options?.inputSink ?? null;
     this.onTitle = options?.onTitle ?? null;
     this.onResize = options?.onResize ?? null;
     this.autoResize = options?.autoResize !== false;
@@ -80,6 +81,29 @@ describe("Terminal component", () => {
     await act(async () => {});
     expect(lastWTermInstance).not.toBeNull();
     expect(lastWTermInstance.init).toHaveBeenCalled();
+  });
+
+  it("forwards semantic input through inputSink", async () => {
+    const inputSink = { send: vi.fn() };
+    await renderTerminal({ inputSink });
+    const event = { type: "focus", focused: true } as const;
+
+    lastWTermInstance.inputSink.send(event);
+
+    expect(inputSink.send).toHaveBeenCalledWith(event);
+    expect(lastWTermInstance.onData).toBeNull();
+  });
+
+  it("types raw and semantic input props as mutually exclusive", () => {
+    const raw: TerminalProps = { onData: vi.fn() };
+    const semantic: TerminalProps = { inputSink: { send: vi.fn() } };
+    // @ts-expect-error raw and semantic outputs cannot be combined
+    const invalid: TerminalProps = {
+      onData: vi.fn(),
+      inputSink: { send: vi.fn() },
+    };
+
+    expect([raw, semantic, invalid]).toHaveLength(3);
   });
 
   it("calls onReady after init", async () => {
@@ -155,6 +179,9 @@ describe("Terminal component", () => {
 
     ref.current!.resize(120, 40);
     expect(lastWTermInstance.resize).toHaveBeenCalledWith(120, 40);
+
+    ref.current!.resize(120, 40, 1200, 800);
+    expect(lastWTermInstance.resize).toHaveBeenCalledWith(120, 40, 1200, 800);
   });
 
   it("delegates focus through imperative handle", async () => {

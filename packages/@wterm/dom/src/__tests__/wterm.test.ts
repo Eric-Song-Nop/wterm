@@ -31,15 +31,66 @@ function createMockBridge(): WasmBridge {
 
 let mockBridge: WasmBridge;
 
-vi.mock("@wterm/core", () => ({
+vi.mock("@wterm/core", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@wterm/core")>()),
   WasmBridge: {
     load: vi.fn(),
   },
 }));
 
 import { WasmBridge as MockedWasmBridge } from "@wterm/core";
-import { WTerm } from "../wterm.js";
+import { WTerm, type WTermOptions } from "../wterm.js";
 import { Renderer } from "../renderer.js";
+
+const defaultResizeObserver = globalThis.ResizeObserver;
+
+function installResizeObserverProbe(): {
+  emit(width: number, height: number): void;
+} {
+  let callback: ResizeObserverCallback | undefined;
+  let observer: ResizeObserver | undefined;
+  class ResizeObserverProbe {
+    constructor(next: ResizeObserverCallback) {
+      callback = next;
+      observer = this as unknown as ResizeObserver;
+    }
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  globalThis.ResizeObserver =
+    ResizeObserverProbe as unknown as typeof ResizeObserver;
+  return {
+    emit(width, height) {
+      if (!callback || !observer) throw new Error("observer was not created");
+      callback(
+        [{ contentRect: { width, height } } as ResizeObserverEntry],
+        observer,
+      );
+    },
+  };
+}
+
+function mockTerminalMeasurements(): void {
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(
+    function () {
+      const node = this as HTMLElement;
+      const width = node.tagName === "SPAN" ? 10 : 800;
+      const height = node.classList?.contains("term-row") ? 10 : 400;
+      return {
+        x: 0,
+        y: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+        left: 0,
+        width,
+        height,
+        toJSON: () => ({}),
+      };
+    },
+  );
+}
 
 describe("WTerm", () => {
   let element: HTMLDivElement;
@@ -53,6 +104,7 @@ describe("WTerm", () => {
   });
 
   afterEach(() => {
+    globalThis.ResizeObserver = defaultResizeObserver;
     element.remove();
     vi.restoreAllMocks();
   });
@@ -506,6 +558,82 @@ describe("WTerm", () => {
   });
 
   describe("resize", () => {
+    it("requests deduplicated semantic resizes without mutating the replica", async () => {
+      const observer = installResizeObserverProbe();
+      mockTerminalMeasurements();
+      const inputSink = { send: vi.fn() };
+      const setup = vi.spyOn(Renderer.prototype, "setup");
+      const term = new WTerm(element, { inputSink });
+      await term.init();
+      inputSink.send.mockClear();
+      vi.mocked(mockBridge.resize).mockClear();
+      setup.mockClear();
+
+      observer.emit(1000, 300);
+      observer.emit(1000, 300);
+
+      expect(inputSink.send).toHaveBeenCalledTimes(1);
+      expect(inputSink.send).toHaveBeenLastCalledWith({
+        type: "resize",
+        cols: 100,
+        rows: 30,
+        widthPx: 1000,
+        heightPx: 300,
+      });
+      expect(mockBridge.resize).not.toHaveBeenCalled();
+      expect(setup).not.toHaveBeenCalled();
+      expect([term.cols, term.rows]).toEqual([80, 24]);
+
+      observer.emit(1001, 300);
+      expect(inputSink.send).toHaveBeenLastCalledWith({
+        type: "resize",
+        cols: 100,
+        rows: 30,
+        widthPx: 1001,
+        heightPx: 300,
+      });
+      expect(inputSink.send).toHaveBeenCalledTimes(2);
+      expect(mockBridge.resize).not.toHaveBeenCalled();
+      term.destroy();
+    });
+
+    it("keeps ResizeObserver resize local in raw mode", async () => {
+      const observer = installResizeObserverProbe();
+      mockTerminalMeasurements();
+      const onResize = vi.fn();
+      const term = new WTerm(element, { onResize });
+      await term.init();
+      vi.mocked(mockBridge.resize).mockClear();
+
+      observer.emit(1000, 300);
+      observer.emit(1000, 300);
+
+      expect(mockBridge.resize).toHaveBeenCalledTimes(1);
+      expect(mockBridge.resize).toHaveBeenCalledWith(100, 30, 1000, 300);
+      expect(onResize).toHaveBeenCalledWith(100, 30);
+      expect([term.cols, term.rows]).toEqual([100, 30]);
+      term.destroy();
+    });
+
+    it("retries a semantic resize when the sink rejects it synchronously", async () => {
+      const observer = installResizeObserverProbe();
+      mockTerminalMeasurements();
+      const inputSink = { send: vi.fn() };
+      const term = new WTerm(element, { inputSink });
+      await term.init();
+      inputSink.send.mockClear();
+      inputSink.send.mockImplementationOnce(() => {
+        throw new Error("transport unavailable");
+      });
+
+      expect(() => observer.emit(1000, 300)).toThrow(/transport unavailable/);
+      expect(() => observer.emit(1000, 300)).not.toThrow();
+
+      expect(inputSink.send).toHaveBeenCalledTimes(2);
+      expect(mockBridge.resize).not.toHaveBeenCalled();
+      term.destroy();
+    });
+
     it("updates cols and rows", async () => {
       const term = new WTerm(element, { autoResize: false });
       await term.init();
@@ -519,6 +647,19 @@ describe("WTerm", () => {
       await term.init();
       term.resize(120, 40);
       expect(mockBridge.resize).toHaveBeenCalledWith(120, 40);
+    });
+
+    it("applies authoritative pixel geometry without feeding the semantic sink", async () => {
+      const inputSink = { send: vi.fn() };
+      const term = new WTerm(element, { autoResize: false, inputSink });
+      await term.init();
+      inputSink.send.mockClear();
+
+      term.resize(120, 40, 1200, 800);
+
+      expect(mockBridge.resize).toHaveBeenCalledWith(120, 40, 1200, 800);
+      expect(inputSink.send).not.toHaveBeenCalled();
+      expect([term.cols, term.rows]).toEqual([120, 40]);
     });
 
     it("fires the onResize callback", async () => {
@@ -667,6 +808,71 @@ describe("WTerm", () => {
 
       expect(onData).toHaveBeenCalledWith("a");
       expect(mockBridge.writeString).not.toHaveBeenCalled();
+    });
+
+    it("rejects raw and semantic input outputs together", () => {
+      // @ts-expect-error raw and semantic outputs are statically exclusive
+      const invalidOptions: WTermOptions = {
+        autoResize: false,
+        onData: vi.fn(),
+        inputSink: { send: vi.fn() },
+      };
+      expect(() => new WTerm(element, invalidOptions)).toThrow(
+        /onData and inputSink are mutually exclusive/,
+      );
+    });
+
+    it("routes browser intent only to the semantic sink", async () => {
+      const inputSink = { send: vi.fn() };
+      const term = new WTerm(element, {
+        autoResize: false,
+        inputSink,
+      });
+      await term.init();
+      inputSink.send.mockClear();
+
+      const textarea = element.querySelector("textarea")!;
+      textarea.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          code: "KeyA",
+          key: "a",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+
+      expect(inputSink.send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "key",
+          code: "KeyA",
+          key: "a",
+          action: "press",
+        }),
+      );
+      expect(mockBridge.writeString).not.toHaveBeenCalled();
+    });
+
+    it("does not misroute replica PTY responses as semantic input", async () => {
+      const inputSink = { send: vi.fn() };
+      vi.mocked(mockBridge.getResponse)
+        .mockReturnValueOnce("replica-response")
+        .mockReturnValue(null);
+      const term = new WTerm(element, {
+        autoResize: false,
+        inputSink,
+      });
+      await term.init();
+      inputSink.send.mockClear();
+      const lateOnData = vi.fn();
+      term.onData = lateOnData;
+      vi.mocked(mockBridge.getResponse)
+        .mockReturnValueOnce("replica-response")
+        .mockReturnValue(null);
+
+      term.write("query");
+
+      expect(inputSink.send).not.toHaveBeenCalled();
+      expect(lateOnData).not.toHaveBeenCalled();
     });
   });
 

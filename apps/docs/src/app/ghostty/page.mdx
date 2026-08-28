@@ -1,6 +1,6 @@
 # Ghostty Core
 
-The `@wterm/ghostty` package provides a full-featured terminal emulation core powered by [libghostty](https://ghostty.org) built directly from upstream source. It implements the same `TerminalCore` interface as wterm's built-in Zig core, so it's a drop-in replacement.
+The `@wterm/ghostty` package provides a full-featured terminal emulation core powered by [libghostty](https://ghostty.org) built directly from reviewed fork source. It implements the same `TerminalCore` interface as wterm's built-in Zig core, so it's a drop-in replacement.
 
 ## Why use it?
 
@@ -225,7 +225,11 @@ const replica = GhosttyCore.fromRuntime(runtime, { effects: "discard" });
 
 URL and byte loads verify the raw WASM digest and set `runtime.artifactVerified` to `true`. The WebAssembly API cannot recover bytes from a precompiled `WebAssembly.Module`, so that input verifies only its embedded source build ID, sets `artifactVerified` to `false`, and is an explicit trust assertion by the caller.
 
-The authority can encode semantic key, paste, and focus input with `encodeKey()`, `encodePaste()`, and `encodeFocus()`. Browser code normalizes keyboard input once with `ghosttyKeyEventFromDom(event)` and sends that object unchanged; the Host passes it directly to `encodeKey()` against authoritative modes rather than implementing another DOM normalization path. The helper preserves physical code, logical key, UTF-8 text, action, AltGraph, composition, and consumed modifiers, while removing AltGraph's browser-synthesized Ctrl+Alt pair. After applying PTY output, `drainEffects()` returns Ghostty's binary PTY replies in production order. Its queue is bounded to 256 frames and 64 KiB. Overflow throws a fatal `GhosttyMutationError` and poisons the core; the Host must terminate the session and must not retry the already-applied write.
+The authority can encode semantic key, paste, focus, and pointer input with `encodeKey()`, `encodePaste()`, `encodeFocus()`, and `encodeMouse()`. Browser code normalizes keyboard input once with the shared `ghosttyKeyEventFromDom(event)` helper and sends that object unchanged; the Host passes it directly to `encodeKey()` against authoritative modes rather than implementing another DOM normalization path. The helper preserves physical code, logical key, UTF-8 text, press/release/repeat action, AltGraph, composition, consumed modifiers, and the reliably observable unshifted code point, while removing AltGraph's browser-synthesized Ctrl+Alt pair.
+
+Before `encodeMouse()`, the authority must have exact pixel geometry from `resize(cols, rows, widthPx, heightPx)`. Its public mouse intent accepts action, button/buttons, modifiers, AltGraph, surface pixels, and optional wheel deltas; replica `cell` and `viewport` observations are deliberately excluded. Ghostty selects its current X10/normal/button/any tracking and coordinate format, derives coordinates again from surface pixels, and owns pressed-button and motion-dedup state. The outer session protocol must reject a stale resize generation before invoking the encoder.
+
+After applying PTY output, `drainEffects()` returns Ghostty's binary PTY replies in production order. Its queue is bounded to 256 frames and 64 KiB. Overflow throws a fatal `GhosttyMutationError` and poisons the core; the Host must terminate the session and must not retry the already-applied write.
 
 `encodeSnapshot()` returns a point-in-time Ghostty binary checkpoint, including any unfinished parser continuation available through `getContinuation()`. A snapshot is not an ordered event protocol; the ordered PTY byte stream remains authoritative between checkpoints.
 

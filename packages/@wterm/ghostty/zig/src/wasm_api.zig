@@ -178,17 +178,20 @@ const WTermHandler = struct {
     inner: TerminalHandler,
     effects: *EffectQueue,
     synchronized_output_generation: *u32,
+    mouse_config_generation: *u32,
 
     pub fn init(
         terminal: *Terminal,
         effects: *EffectQueue,
-        generation: *u32,
+        sync_generation: *u32,
+        mouse_config_generation: *u32,
         authority: bool,
     ) WTermHandler {
         var result: WTermHandler = .{
             .inner = .init(terminal),
             .effects = effects,
-            .synchronized_output_generation = generation,
+            .synchronized_output_generation = sync_generation,
+            .mouse_config_generation = mouse_config_generation,
         };
         if (authority) {
             result.inner.effects.write_pty = &writePty;
@@ -244,6 +247,8 @@ const WTermHandler = struct {
         comptime action: StreamAction.Tag,
         value: StreamAction.Value(action),
     ) void {
+        const mouse_event_before = self.inner.terminal.flags.mouse_event;
+        const mouse_format_before = self.inner.terminal.flags.mouse_format;
         switch (action) {
             .set_mode => {
                 const was_synchronized = self.inner.terminal.modes.get(.synchronized_output);
@@ -267,6 +272,11 @@ const WTermHandler = struct {
             },
             else => self.inner.vt(action, value),
         }
+        if (mouse_event_before != self.inner.terminal.flags.mouse_event or
+            mouse_format_before != self.inner.terminal.flags.mouse_format)
+        {
+            self.mouse_config_generation.* +%= 1;
+        }
     }
 };
 
@@ -278,6 +288,10 @@ const State = struct {
     render: RenderState,
     effects: EffectQueue,
     synchronized_output_generation: u32,
+    mouse_config_generation: u32,
+    mouse_encoded_config_generation: u32,
+    mouse_buttons: u32,
+    mouse_last_cell: ?vt.Coordinate,
     output: []u8,
 };
 
@@ -378,6 +392,10 @@ fn stateFromDecoded(
     state.terminal = decoded.toOwned();
     state.effects = .{};
     state.synchronized_output_generation = 0;
+    state.mouse_config_generation = 0;
+    state.mouse_encoded_config_generation = 0;
+    state.mouse_buttons = 0;
+    state.mouse_last_cell = null;
     state.stream = .init(.{
         .allocator = allocator,
         .continuation_max_bytes = continuation_max_bytes,
@@ -385,6 +403,7 @@ fn stateFromDecoded(
             &state.terminal,
             &state.effects,
             &state.synchronized_output_generation,
+            &state.mouse_config_generation,
             false,
         ),
     });
@@ -451,6 +470,10 @@ export fn init(
     };
     state.effects = .{};
     state.synchronized_output_generation = 0;
+    state.mouse_config_generation = 0;
+    state.mouse_encoded_config_generation = 0;
+    state.mouse_buttons = 0;
+    state.mouse_last_cell = null;
     state.stream = .init(.{
         .allocator = allocator,
         .continuation_max_bytes = CONTINUATION_MAX_BYTES,
@@ -458,6 +481,7 @@ export fn init(
             &state.terminal,
             &state.effects,
             &state.synchronized_output_generation,
+            &state.mouse_config_generation,
             effects_mode != 0,
         ),
     });
@@ -483,6 +507,7 @@ export fn resize(ptr: usize, cols: u16, rows: u16, width_px: u32, height_px: u32
         .rows = rows,
         .cell_size_px = cell_size,
     }) catch return MUTATION_RESIZE_FAILURE;
+    state.mouse_last_cell = null;
     if (state.effects.dropped_frames != dropped_before) return MUTATION_EFFECT_OVERFLOW;
     return MUTATION_OK;
 }
@@ -743,6 +768,7 @@ export fn restore_resize(
         handle.status = RESTORE_STATUS_RESIZE_FAILURE;
         return handle.status;
     };
+    state.mouse_last_cell = null;
     handle.status = RESTORE_STATUS_OK;
     return RESTORE_STATUS_OK;
 }
@@ -845,6 +871,10 @@ export fn encode_paste(
 
 export fn encode_focus(ptr: usize, gained: u32) u32 {
     const state = stateFromPtr(ptr);
+    if (gained == 0) {
+        state.mouse_buttons = 0;
+        state.mouse_last_cell = null;
+    }
     if (!state.terminal.modes.get(.focus_event)) {
         replaceOutput(state, &.{});
         return 0;
@@ -856,6 +886,62 @@ export fn encode_focus(ptr: usize, gained: u32) u32 {
         &writer.writer,
         if (gained != 0) .gained else .lost,
     ) catch return OUTPUT_ERROR;
+    return finishOutput(state, &writer);
+}
+
+export fn encode_mouse(
+    ptr: usize,
+    action_raw: u32,
+    button_raw: u32,
+    buttons: u32,
+    modifiers: u16,
+    x: f32,
+    y: f32,
+) u32 {
+    if (action_raw > @intFromEnum(vt.input.MouseAction.motion) or
+        button_raw > @intFromEnum(vt.input.MouseButton.eleven) or
+        buttons > 0b1_1111 or
+        !std.math.isFinite(x) or
+        !std.math.isFinite(y))
+    {
+        return OUTPUT_ERROR;
+    }
+
+    const state = stateFromPtr(ptr);
+    const terminal = &state.terminal;
+    if (terminal.cols == 0 or terminal.rows == 0 or
+        terminal.width_px == 0 or terminal.height_px == 0)
+    {
+        return OUTPUT_ERROR;
+    }
+    if (state.mouse_encoded_config_generation != state.mouse_config_generation) {
+        state.mouse_last_cell = null;
+        state.mouse_encoded_config_generation = state.mouse_config_generation;
+    }
+    state.mouse_buttons = buttons;
+
+    var options: vt.input.MouseEncodeOptions = .fromTerminal(terminal, .{
+        .screen = .{
+            .width = terminal.width_px,
+            .height = terminal.height_px,
+        },
+        .cell = .{
+            .width = @max(1, terminal.width_px / terminal.cols),
+            .height = @max(1, terminal.height_px / terminal.rows),
+        },
+        .padding = .{},
+    });
+    options.any_button_pressed = state.mouse_buttons != 0;
+    options.last_cell = &state.mouse_last_cell;
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    vt.input.encodeMouse(&writer.writer, .{
+        .action = @enumFromInt(action_raw),
+        .button = if (button_raw == 0) null else @enumFromInt(button_raw),
+        .mods = @bitCast(modifiers),
+        .pos = .{ .x = x, .y = y },
+    }, options) catch return OUTPUT_ERROR;
     return finishOutput(state, &writer);
 }
 
@@ -1197,8 +1283,10 @@ export fn using_alt_screen(ptr: usize) u32 {
 export fn mouse_tracking(ptr: usize) u32 {
     const state = stateFromPtr(ptr);
     return switch (state.terminal.flags.mouse_event) {
+        .x10 => 9,
         .normal => 1000,
         .button => 1002,
+        .any => 1003,
         else => 0,
     };
 }

@@ -15,6 +15,7 @@ vi.mock("@wterm/dom", () => {
     this.cols = options?.cols ?? 80;
     this.rows = options?.rows ?? 24;
     this.onData = options?.onData ?? null;
+    this.inputSink = options?.inputSink ?? null;
     this.onTitle = options?.onTitle ?? null;
     this.onResize = options?.onResize ?? null;
     this.autoResize = options?.autoResize !== false;
@@ -80,6 +81,49 @@ describe("Terminal component", () => {
     await flushPromises();
     expect(lastWTermInstance).not.toBeNull();
     expect(lastWTermInstance.init).toHaveBeenCalled();
+  });
+
+  it("forwards semantic input through inputSink", async () => {
+    const inputSink = { send: vi.fn() };
+    await mountTerminal({ inputSink });
+    const event = { type: "focus", focused: true } as const;
+
+    lastWTermInstance.inputSink.send(event);
+
+    expect(inputSink.send).toHaveBeenCalledWith(event);
+    expect(lastWTermInstance.onData).toBeNull();
+  });
+
+  it("forwards through the latest inputSink and stops after unmount", async () => {
+    const sinkA = { send: vi.fn() };
+    const sinkB = { send: vi.fn() };
+    const wrapper = await mountTerminal({ inputSink: sinkA });
+    const proxy = lastWTermInstance.inputSink;
+    const event = { type: "focus", focused: true } as const;
+
+    await wrapper.setProps({ inputSink: sinkB });
+    proxy.send(event);
+    expect(sinkA.send).not.toHaveBeenCalled();
+    expect(sinkB.send).toHaveBeenCalledTimes(1);
+
+    await wrapper.setProps({ inputSink: undefined });
+    proxy.send(event);
+    expect(sinkB.send).toHaveBeenCalledTimes(1);
+
+    await wrapper.setProps({ inputSink: sinkB });
+    wrapper.unmount();
+    proxy.send(event);
+    expect(sinkB.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects inputSink with a data listener", async () => {
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    await expect(
+      mountTerminal({ inputSink: { send: vi.fn() } }, { onData: vi.fn() }),
+    ).rejects.toThrow(/data listener and inputSink are mutually exclusive/);
+    consoleError.mockRestore();
   });
 
   it("emits ready after init", async () => {
@@ -148,6 +192,9 @@ describe("Terminal component", () => {
     await flushPromises();
     (wrapper.vm as any).resize(120, 40);
     expect(lastWTermInstance.resize).toHaveBeenCalledWith(120, 40);
+
+    (wrapper.vm as any).resize(120, 40, 1200, 800);
+    expect(lastWTermInstance.resize).toHaveBeenCalledWith(120, 40, 1200, 800);
   });
 
   it("delegates focus through imperative handle", async () => {

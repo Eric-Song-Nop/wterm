@@ -41,9 +41,24 @@ const term = new WTerm(document.getElementById("terminal"), {
 await term.init();
 ```
 
+For a remote terminal whose Host owns the authoritative emulator, send semantic browser intent instead of replica-encoded bytes:
+
+```ts
+const term = new WTerm(document.getElementById("terminal"), {
+  core: replica,
+  inputSink: {
+    send(event) {
+      session.sendInput(event);
+    },
+  },
+});
+```
+
+`onData` and `inputSink` are mutually exclusive. Semantic mode always reports focus transitions and preserves original paste, key, IME, pointer, and resize intent; the Host decides whether its current modes produce PTY bytes. Its `ResizeObserver` never reflows the replica directly. Apply a session-accepted size with `WTerm.resize(cols, rows, widthPx, heightPx)`.
+
 ## Options and Methods
 
-The `WTerm` constructor accepts all [shared terminal options](/api-reference#terminal-options) (`cols`, `rows`, `core`, `wasmUrl`, `autoResize`, `cursorBlink`, `onData`, `onTitle`, `onResize`). Pass a [`TerminalCore`](/ghostty) instance to the `core` option to use an alternative emulation backend.
+The `WTerm` constructor accepts all [shared terminal options](/api-reference#terminal-options) (`cols`, `rows`, `core`, `wasmUrl`, `autoResize`, `cursorBlink`, `onData`, `inputSink`, `onTitle`, `onResize`). Pass a [`TerminalCore`](/ghostty) instance to the `core` option to use an alternative emulation backend.
 
 See [WTerm Methods](/api-reference#wterm-methods) for the full list of instance methods (`init`, `write`, `resize`, `focus`, `destroy`).
 

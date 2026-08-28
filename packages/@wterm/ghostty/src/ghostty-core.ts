@@ -1,8 +1,13 @@
-import type {
-  CellData,
-  CursorState,
-  UnhandledSequence,
-  TerminalCore,
+import {
+  TerminalInputModifier,
+  terminalKeyEventFromDom,
+  type TerminalDomKeyEvent,
+  type TerminalKeyEvent,
+  type TerminalMouseIntent,
+  type CellData,
+  type CursorState,
+  type UnhandledSequence,
+  type TerminalCore,
 } from "@wterm/core";
 import {
   type GhosttyWasm,
@@ -80,52 +85,11 @@ export interface GhosttyOptions {
   effects?: "authority" | "discard";
 }
 
-export const GhosttyModifier = Object.freeze({
-  Shift: 1 << 0,
-  Control: 1 << 1,
-  Alt: 1 << 2,
-  Super: 1 << 3,
-  CapsLock: 1 << 4,
-  NumLock: 1 << 5,
-} as const);
-
-export interface GhosttyKeyEvent {
-  /** Logical DOM key, physical code, or a Ghostty snake_case key name. */
-  key: string;
-  /** Physical DOM code. When present, this is the key Ghostty encodes. */
-  code?: string;
-  text?: string;
-  modifiers?: number;
-  consumedModifiers?: number;
-  /** Remove the synthetic Ctrl+Alt pair browsers use for AltGraph text. */
-  altGraph?: boolean;
-  action?: "press" | "release" | "repeat";
-  repeat?: boolean;
-  composing?: boolean;
-  unshiftedCodepoint?: number;
-}
-
-export interface GhosttyDomKeyEvent {
-  type?: string;
-  code: string;
-  key: string;
-  shiftKey: boolean;
-  ctrlKey: boolean;
-  altKey: boolean;
-  metaKey: boolean;
-  repeat: boolean;
-  isComposing?: boolean;
-  getModifierState?(key: string): boolean;
-}
-
-export interface GhosttyNormalizedKeyEvent extends GhosttyKeyEvent {
-  code: string;
-  modifiers: number;
-  consumedModifiers: number;
-  altGraph: boolean;
-  action: "press" | "release" | "repeat";
-  composing: boolean;
-}
+export const GhosttyModifier = TerminalInputModifier;
+export type GhosttyKeyEvent = Pick<TerminalKeyEvent, "key"> &
+  Partial<Omit<TerminalKeyEvent, "key">>;
+export type GhosttyDomKeyEvent = TerminalDomKeyEvent;
+export type GhosttyNormalizedKeyEvent = TerminalKeyEvent;
 
 export interface GhosttyEffectStats {
   droppedFrames: number;
@@ -158,32 +122,7 @@ const CHARACTER_KEYS: Readonly<Record<string, string>> = Object.freeze({
 export function ghosttyKeyEventFromDom(
   event: GhosttyDomKeyEvent,
 ): GhosttyNormalizedKeyEvent {
-  let modifiers = 0;
-  if (event.shiftKey) modifiers |= GhosttyModifier.Shift;
-  if (event.ctrlKey) modifiers |= GhosttyModifier.Control;
-  if (event.altKey) modifiers |= GhosttyModifier.Alt;
-  if (event.metaKey) modifiers |= GhosttyModifier.Super;
-  if (event.getModifierState?.("CapsLock"))
-    modifiers |= GhosttyModifier.CapsLock;
-  if (event.getModifierState?.("NumLock")) modifiers |= GhosttyModifier.NumLock;
-  const altGraph = event.getModifierState?.("AltGraph") ?? false;
-  if (altGraph) {
-    modifiers &= ~(GhosttyModifier.Control | GhosttyModifier.Alt);
-  }
-  const text = Array.from(event.key).length === 1 ? event.key : undefined;
-  const action =
-    event.type === "keyup" ? "release" : event.repeat ? "repeat" : "press";
-  return {
-    code: event.code,
-    key: event.key,
-    text,
-    modifiers,
-    consumedModifiers:
-      text === undefined ? 0 : modifiers & GhosttyModifier.Shift,
-    altGraph,
-    action,
-    composing: event.isComposing ?? false,
-  };
+  return terminalKeyEventFromDom(event);
 }
 
 function normalizeKeyName(value: string): string {
@@ -548,6 +487,80 @@ export class GhosttyCore implements TerminalCore {
     );
   }
 
+  /** Encode pointer intent against authoritative mouse modes and geometry. */
+  encodeMouse(event: TerminalMouseIntent): Uint8Array {
+    this._assertOperational();
+    if (
+      event.action !== "press" &&
+      event.action !== "release" &&
+      event.action !== "move" &&
+      event.action !== "wheel"
+    ) {
+      throw new Error("@wterm/ghostty: invalid mouse action");
+    }
+    if (
+      !Number.isFinite(event.surface.x) ||
+      !Number.isFinite(event.surface.y) ||
+      !Number.isInteger(event.buttons) ||
+      event.buttons < 0 ||
+      event.buttons > 0b1_1111 ||
+      !Number.isInteger(event.modifiers) ||
+      event.modifiers < 0 ||
+      event.modifiers > 0xffff
+    ) {
+      throw new Error("@wterm/ghostty: invalid mouse input");
+    }
+    if (event.action === "press" || event.action === "release") {
+      if (
+        !Number.isInteger(event.button) ||
+        event.button === null ||
+        event.button < 0 ||
+        event.button > 4
+      ) {
+        throw new Error("@wterm/ghostty: invalid DOM mouse button");
+      }
+    } else if (event.button !== null) {
+      throw new Error(
+        "@wterm/ghostty: mouse move and wheel require a null button",
+      );
+    }
+
+    let action: number;
+    let button: number;
+    if (event.action === "wheel") {
+      const deltaX = event.deltaX ?? 0;
+      const deltaY = event.deltaY ?? 0;
+      if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) {
+        throw new Error("@wterm/ghostty: invalid mouse wheel delta");
+      }
+      if (Math.abs(deltaX) > Math.abs(deltaY)) {
+        if (deltaX === 0) return new Uint8Array();
+        button = deltaX < 0 ? 6 : 7;
+      } else {
+        if (deltaY === 0) return new Uint8Array();
+        button = deltaY < 0 ? 4 : 5;
+      }
+      action = 0;
+    } else {
+      action =
+        event.action === "press" ? 0 : event.action === "release" ? 1 : 2;
+      button = this._mouseButton(event);
+    }
+
+    return this._copyOutput(
+      this.wasm.exports.encode_mouse(
+        this.termPtr,
+        action,
+        button,
+        event.buttons,
+        event.modifiers,
+        event.surface.x,
+        event.surface.y,
+      ),
+      "mouse encoding",
+    );
+  }
+
   /** Encode a synchronous Ghostty binary checkpoint, including continuation. */
   encodeSnapshot(): Uint8Array {
     this._assertOperational();
@@ -555,6 +568,31 @@ export class GhosttyCore implements TerminalCore {
       this.wasm.exports.encode_snapshot(this.termPtr),
       "snapshot encoding",
     );
+  }
+
+  private _mouseButton(event: TerminalMouseIntent): number {
+    const domButton =
+      event.action === "move"
+        ? event.buttons & 1
+          ? 0
+          : event.buttons & 4
+            ? 1
+            : event.buttons & 2
+              ? 2
+              : event.buttons & 8
+                ? 3
+                : event.buttons & 16
+                  ? 4
+                  : null
+        : event.button;
+    if (domButton === null) return 0;
+    if (domButton === 0) return 1;
+    if (domButton === 1) return 3;
+    if (domButton === 2) return 2;
+    // Xterm reserves buttons four through seven for wheel directions.
+    if (domButton === 3) return 8;
+    if (domButton === 4) return 9;
+    throw new Error("@wterm/ghostty: unsupported DOM mouse button");
   }
 
   /** Export the exact replay-safe parser continuation retained by Ghostty. */
@@ -654,10 +692,12 @@ export class GhosttyCore implements TerminalCore {
     return this.wasm.exports.using_alt_screen(this.termPtr) !== 0;
   }
 
-  mouseTracking(): 0 | 1000 | 1002 {
+  mouseTracking(): 0 | 9 | 1000 | 1002 | 1003 {
     this._assertOperational();
     const mode = this.wasm.exports.mouse_tracking(this.termPtr);
-    return mode === 1000 || mode === 1002 ? mode : 0;
+    return mode === 9 || mode === 1000 || mode === 1002 || mode === 1003
+      ? mode
+      : 0;
   }
 
   mouseSgr(): boolean {

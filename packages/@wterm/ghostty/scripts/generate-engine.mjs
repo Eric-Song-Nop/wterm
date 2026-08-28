@@ -20,7 +20,7 @@ const WASM_PATH = path.join(PACKAGE_DIR, "wasm", "ghostty-vt.wasm");
 const MANIFEST_PATH = path.join(PACKAGE_DIR, "engine-manifest.json");
 const TS_PATH = path.join(PACKAGE_DIR, "src", "engine.ts");
 const ZIG_ENGINE_PATH = path.join(ZIG_DIR, "src", "engine_manifest.zig");
-const ADAPTER_ABI_VERSION = 3;
+const ADAPTER_ABI_VERSION = 4;
 const GHOSTTY_UPSTREAM_BASE_COMMIT = "f2d5758f6305867dc36b36293c6165d8152b853e";
 const TERMINAL_PROFILE = Object.freeze({
   colorScheme: "derived-from-background",

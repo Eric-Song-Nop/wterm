@@ -20,6 +20,20 @@ const wasmBytes = readFileSync(
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 
+type MouseInput = Parameters<GhosttyCore["encodeMouse"]>[0];
+
+function mouseInput(overrides: Partial<MouseInput> = {}): MouseInput {
+  return {
+    action: "press",
+    button: 0,
+    buttons: 1,
+    modifiers: 0,
+    altGraph: false,
+    surface: { x: 15, y: 15 },
+    ...overrides,
+  };
+}
+
 function snapshotContinuation(snapshot: Uint8Array): Uint8Array {
   const view = new DataView(
     snapshot.buffer,
@@ -178,6 +192,229 @@ describe("GhosttyCore authority primitives", () => {
         }),
       ),
     ).toBe("\x1b[99;6u");
+    core.dispose();
+  });
+
+  it("encodes mouse buttons and wheel directions from authoritative modes", async () => {
+    const runtime = await runtimeFromBytes();
+    const core = GhosttyCore.fromRuntime(runtime);
+    core.init(80, 40);
+    core.resize(80, 40, 800, 400);
+
+    expect(core.encodeMouse(mouseInput())).toEqual(new Uint8Array());
+    core.writeString("\x1b[?1000h\x1b[?1006h");
+    expect(
+      decoder.decode(
+        core.encodeMouse(
+          mouseInput({
+            modifiers: GhosttyModifier.Control,
+            surface: { x: 75, y: 45 },
+          }),
+        ),
+      ),
+    ).toBe("\x1b[<16;8;5M");
+    for (const [button, buttons, code] of [
+      [1, 4, 1],
+      [2, 2, 2],
+      [3, 8, 128],
+      [4, 16, 129],
+    ] as const) {
+      expect(
+        decoder.decode(
+          core.encodeMouse(
+            mouseInput({ button, buttons, surface: { x: 75, y: 45 } }),
+          ),
+        ),
+      ).toBe(`\x1b[<${code};8;5M`);
+    }
+    expect(
+      decoder.decode(
+        core.encodeMouse(
+          mouseInput({
+            action: "release",
+            button: 0,
+            buttons: 0,
+            modifiers: GhosttyModifier.Control,
+            surface: { x: 95, y: 55 },
+          }),
+        ),
+      ),
+    ).toBe("\x1b[<16;10;6m");
+    expect(
+      decoder.decode(
+        core.encodeMouse(
+          mouseInput({
+            action: "wheel",
+            button: null,
+            buttons: 0,
+            surface: { x: 95, y: 55 },
+            deltaX: 0,
+            deltaY: 10,
+          }),
+        ),
+      ),
+    ).toBe("\x1b[<65;10;6M");
+    expect(
+      decoder.decode(
+        core.encodeMouse(
+          mouseInput({
+            action: "wheel",
+            button: null,
+            buttons: 0,
+            surface: { x: 95, y: 55 },
+            deltaX: -10,
+            deltaY: 2,
+          }),
+        ),
+      ),
+    ).toBe("\x1b[<66;10;6M");
+    expect(
+      decoder.decode(
+        core.encodeMouse(
+          mouseInput({
+            action: "wheel",
+            button: null,
+            buttons: 0,
+            surface: { x: 95, y: 55 },
+            deltaX: 0,
+            deltaY: -10,
+          }),
+        ),
+      ),
+    ).toBe("\x1b[<64;10;6M");
+    expect(
+      decoder.decode(
+        core.encodeMouse(
+          mouseInput({
+            action: "wheel",
+            button: null,
+            buttons: 0,
+            surface: { x: 95, y: 55 },
+            deltaX: 10,
+            deltaY: 2,
+          }),
+        ),
+      ),
+    ).toBe("\x1b[<67;10;6M");
+    core.dispose();
+  });
+
+  it("keeps authoritative button and cell-dedup state across mouse events", async () => {
+    const runtime = await runtimeFromBytes();
+    const core = GhosttyCore.fromRuntime(runtime);
+    core.init(80, 40);
+    core.resize(80, 40, 800, 400);
+    core.writeString("\x1b[?1002h\x1b[?1006h");
+
+    expect(decoder.decode(core.encodeMouse(mouseInput()))).toBe("\x1b[<0;2;2M");
+    expect(
+      core.encodeMouse(
+        mouseInput({
+          action: "move",
+          button: null,
+          surface: { x: 16, y: 16 },
+        }),
+      ),
+    ).toEqual(new Uint8Array());
+    expect(
+      decoder.decode(
+        core.encodeMouse(
+          mouseInput({
+            action: "move",
+            button: null,
+            surface: { x: 25, y: 15 },
+          }),
+        ),
+      ),
+    ).toBe("\x1b[<32;3;2M");
+    expect(
+      decoder.decode(
+        core.encodeMouse(
+          mouseInput({
+            action: "release",
+            button: 0,
+            buttons: 0,
+            surface: { x: 25, y: 15 },
+          }),
+        ),
+      ),
+    ).toBe("\x1b[<0;3;2m");
+    expect(
+      core.encodeMouse(
+        mouseInput({
+          action: "move",
+          button: null,
+          buttons: 0,
+          surface: { x: 35, y: 15 },
+        }),
+      ),
+    ).toEqual(new Uint8Array());
+
+    core.writeString("\x1b[?1002l\x1b[?1003h");
+    expect(
+      decoder.decode(
+        core.encodeMouse(
+          mouseInput({
+            action: "move",
+            button: null,
+            buttons: 0,
+            surface: { x: 35, y: 15 },
+          }),
+        ),
+      ),
+    ).toBe("\x1b[<35;4;2M");
+
+    // A disable/re-enable cycle ends on the same mode value but still starts
+    // a new motion-reporting epoch, so the previous cell must not suppress it.
+    core.writeString("\x1b[?1003l\x1b[?1000h\x1b[?1000l\x1b[?1003h");
+    expect(
+      decoder.decode(
+        core.encodeMouse(
+          mouseInput({
+            action: "move",
+            button: null,
+            buttons: 0,
+            surface: { x: 35, y: 15 },
+          }),
+        ),
+      ),
+    ).toBe("\x1b[<35;4;2M");
+    core.dispose();
+  });
+
+  it("uses authoritative pixel geometry and rejects missing geometry", async () => {
+    const runtime = await runtimeFromBytes();
+    const core = GhosttyCore.fromRuntime(runtime);
+    core.init(80, 40);
+    core.writeString("\x1b[?1000h\x1b[?1016h");
+
+    expect(() => core.encodeMouse(mouseInput())).toThrow(
+      /mouse encoding failed/,
+    );
+    core.resize(80, 40, 800, 400);
+    expect(
+      decoder.decode(
+        core.encodeMouse(mouseInput({ surface: { x: 9.4, y: 19.6 } })),
+      ),
+    ).toBe("\x1b[<0;9;20M");
+    core.dispose();
+  });
+
+  it("rejects malformed semantic mouse input before the WASM ABI", async () => {
+    const runtime = await runtimeFromBytes();
+    const core = GhosttyCore.fromRuntime(runtime);
+    core.init(80, 40);
+    core.resize(80, 40, 800, 400);
+
+    expect(() =>
+      core.encodeMouse(mouseInput({ action: "invalid" as "press" })),
+    ).toThrow(/invalid mouse action/);
+    expect(() => core.encodeMouse(mouseInput({ button: 5 }))).toThrow(
+      /invalid DOM mouse button/,
+    );
+    expect(() =>
+      core.encodeMouse(mouseInput({ action: "move", button: 0 })),
+    ).toThrow(/require a null button/);
     core.dispose();
   });
 

@@ -1,7 +1,7 @@
 import { describe, it, expectTypeOf } from "vitest";
 import { ref } from "vue";
 import { Terminal } from "../index.js";
-import type { WTerm } from "@wterm/dom";
+import type { InputSink, WTerm } from "@wterm/dom";
 
 describe("Terminal types", () => {
   it("template refs carry the imperative handle", () => {
@@ -12,7 +12,13 @@ describe("Terminal types", () => {
       ((data: string | Uint8Array) => void) | undefined
     >();
     expectTypeOf(r.value?.resize).toEqualTypeOf<
-      ((cols: number, rows: number) => void) | undefined
+      | ((
+          cols: number,
+          rows: number,
+          widthPx?: number,
+          heightPx?: number,
+        ) => void)
+      | undefined
     >();
     expectTypeOf(r.value?.focus).toEqualTypeOf<(() => void) | undefined>();
     expectTypeOf(r.value?.instance).toEqualTypeOf<WTerm | null | undefined>();
@@ -22,6 +28,7 @@ describe("Terminal types", () => {
       r.value?.write("x");
       r.value?.write(new Uint8Array());
       r.value?.resize(80, 24);
+      r.value?.resize(80, 24, 800, 408);
       r.value?.focus();
 
       // @ts-expect-error — wrong argument type
@@ -35,7 +42,12 @@ describe("Terminal types", () => {
     type Instance = NonNullable<InstanceType<typeof Terminal>>;
     expectTypeOf<Instance>().toExtend<{
       write: (data: string | Uint8Array) => void;
-      resize: (cols: number, rows: number) => void;
+      resize: (
+        cols: number,
+        rows: number,
+        widthPx?: number,
+        heightPx?: number,
+      ) => void;
       focus: () => void;
       instance: WTerm | null;
     }>();
@@ -50,6 +62,7 @@ describe("Terminal types", () => {
     expectTypeOf<Props["autoResize"]>().toEqualTypeOf<boolean | undefined>();
     expectTypeOf<Props["cursorBlink"]>().toEqualTypeOf<boolean | undefined>();
     expectTypeOf<Props["debug"]>().toEqualTypeOf<boolean | undefined>();
+    expectTypeOf<Props["inputSink"]>().toEqualTypeOf<InputSink | undefined>();
   });
 
   it("typed emit signatures", () => {

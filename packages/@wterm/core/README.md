@@ -59,7 +59,7 @@ bridge.dispose();
 | `init(cols, rows)`               | Initialize the terminal grid                                                                                   |
 | `writeString(str, afterChunk?)`  | Write a UTF-8 string, optionally running a callback after each internal chunk                                  |
 | `writeRaw(data, afterChunk?)`    | Write raw bytes, optionally running a callback after each internal chunk                                       |
-| `resize(cols, rows)`             | Resize the terminal grid                                                                                       |
+| `resize(cols, rows, widthPx?, heightPx?)` | Resize the terminal grid and optionally record authoritative CSS-pixel geometry                                |
 | `dispose()`                      | Idempotently release the core. The instance cannot be reused afterward.                                        |
 | `getCell(row, col)`              | Get cell data, including optional resolved OSC 8 metadata (`linkUri`, explicit `linkId`, and opaque `linkKey`) |
 | `getCursor()`                    | Get cursor state (`{ row, col, visible }`)                                                                     |
@@ -76,7 +76,7 @@ bridge.dispose();
 | `cursorKeysApp()`                | Whether cursor keys are in application mode                                                                    |
 | `bracketedPaste()`               | Whether bracketed paste mode is active                                                                         |
 | `usingAltScreen()`               | Whether the alternate screen buffer is active                                                                  |
-| `mouseTracking()`                | Active mouse tracking mode (`0`, `1000`, or `1002`)                                                            |
+| `mouseTracking()`                | Active mouse tracking mode (`0`, `9`, `1000`, `1002`, or `1003`)                                               |
 | `mouseSgr()`                     | Whether SGR mouse encoding is active                                                                           |
 | `focusEvents()`                  | Whether focus reporting is active                                                                              |
 | `synchronizedOutput()`           | Whether synchronized output mode (2026) is active                                                              |
@@ -87,6 +87,28 @@ Every `TerminalCore` implementation must provide a non-throwing, idempotent `dis
 OSC 8 hyperlink metadata is optional so third-party `TerminalCore` implementations remain source-compatible. Cores should expose the resolved URI and an opaque semantic key rather than a private numeric index.
 
 The built-in core reports its fixed hyperlink identity capacity through `getResourceState()`. When `hyperlinks.saturated` is true, new distinct OSC 8 links render as plain text and `hyperlinks.rejected` counts capacity-rejected opens. Existing identities remain valid.
+
+### Semantic Input Boundary
+
+`@wterm/core` exports the transport-neutral `InputSink`, `TerminalInputEvent`, and related event types. `terminalKeyEventFromDom()` is the single browser-key normalization path shared by the DOM and Ghostty integrations. It preserves physical `code`, logical `key`, printable `text`, modifiers and consumed modifiers, AltGraph, press/release/repeat action, composition state, and the reliably observable unshifted code point.
+
+An `InputSink` receives one discriminated union:
+
+```ts
+interface InputSink {
+  send(event: TerminalInputEvent): void;
+}
+
+type TerminalInputEvent =
+  | TerminalKeyInputEvent
+  | TerminalTextInputEvent
+  | TerminalPasteInputEvent
+  | TerminalFocusInputEvent
+  | TerminalMouseInputEvent
+  | TerminalResizeInputEvent;
+```
+
+These events describe browser intent; they are not PTY bytes and do not depend on replica terminal modes. Resize events carry the requested grid and CSS-pixel surface geometry. A remote session layer attaches ordering and resize-generation fences before transport, applies an accepted resize to its authority, and only then updates a replica.
 
 ### `WebSocketTransport`
 

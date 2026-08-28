@@ -256,6 +256,12 @@ describe("WasmBridge", () => {
       bridge.resize(40, 12);
       expect(bridge.getCell(0, 0).char).toBe(65);
     });
+
+    it("accepts authority pixel geometry even though the built-in ABI ignores it", () => {
+      bridge.resize(40, 12, 400, 240);
+      expect(bridge.getCols()).toBe(40);
+      expect(bridge.getRows()).toBe(12);
+    });
   });
 
   describe("SGR attributes", () => {

@@ -44,10 +44,11 @@ new WTerm(element: HTMLElement, options?: WTermOptions)
 | `rows` | `number` | `24` | Initial row count |
 | `core` | `TerminalCore` | — | Pre-constructed core owned and disposed by WTerm |
 | `wasmUrl` | `string` | — | Optional URL to serve the WASM binary separately (embedded by default) |
-| `autoResize` | `boolean` | `true` | Auto-resize based on container dimensions |
+| `autoResize` | `boolean` | `true` | Observe container dimensions. Raw mode resizes locally; semantic mode emits resize intent. |
 | `cursorBlink` | `boolean` | `false` | Enable cursor blinking animation |
 | `debug` | `boolean` | `false` | Enable debug mode. Exposes a `DebugAdapter` on the instance (`wt.debug`) for inspecting escape sequences, cell data, render performance, and unhandled CSI sequences. |
-| `onData` | `(data: string) => void` | — | Called when the terminal produces data (user input or host response). When omitted, input is echoed back automatically. |
+| `onData` | `(data: string) => void` | — | Legacy raw-input bytes and core responses. When omitted, raw input is echoed locally. Mutually exclusive with `inputSink`. |
+| `inputSink` | `InputSink` | — | Semantic browser intent for a remote authority. Mutually exclusive with `onData`. |
 | `onTitle` | `(title: string) => void` | — | Called when the terminal title changes |
 | `onResize` | `(cols: number, rows: number) => void` | — | Called on resize |
 
@@ -57,14 +58,31 @@ new WTerm(element: HTMLElement, options?: WTermOptions)
 |---|---|
 | `init(): Promise<WTerm>` | Load WASM and start rendering |
 | `write(data: string \| Uint8Array)` | Write data to the terminal |
-| `resize(cols, rows)` | Resize the terminal grid |
+| `resize(cols, rows, widthPx?, heightPx?)` | Apply an authoritative grid and optional CSS-pixel surface size without emitting input |
 | `adoptCore(core)` | Atomically replace the active core with an already initialized core |
 | `focus()` | Focus the terminal element |
 | `destroy()` | Dispose the active core and clean up event listeners and DOM |
 
 `adoptCore()` stages the replacement core's first frame outside the live DOM. On success, WTerm takes ownership and disposes the previous core. If validation or rendering fails, the existing core and DOM remain active and the caller retains ownership of the replacement. Adoption does not call `init()`, `onData`, or `onResize`. A viewport following the bottom stays there; otherwise its distance from the bottom is preserved and clamped to the replacement's scroll range.
 
-When a terminal application enables modes 1000 or 1002 with SGR encoding (1006), pointer input is sent through `onData`. Focus reports are sent when mode 1004 is active.
+In raw mode, terminal mouse and focus modes on the local core determine the bytes sent through `onData`. This preserves the existing local-terminal behavior.
+
+For a remote authority, pass `inputSink` instead:
+
+```ts
+const term = new WTerm(element, {
+  core: replica,
+  inputSink: {
+    send(event) {
+      session.sendInput(event);
+    },
+  },
+});
+```
+
+Semantic mode never calls `onData` and never encodes input from replica modes. It emits normalized key press/release/repeat, committed text/IME, original paste text, deduplicated focus transitions, pointer intent, and deduplicated resize requests. In this mode `ResizeObserver` does not mutate the replica or rebuild its renderer. The session orders a resize request, applies it on the Host, and uses `WTerm.resize(cols, rows, widthPx, heightPx)` only when the authoritative state is ready; that explicit apply never feeds the `InputSink` back.
+
+Mouse events include surface pixels plus locally observed cell and viewport geometry. The cell and viewport are hints only: the Host must validate its session resize fence and encode from the authoritative terminal's modes and geometry. A detached replica can receive the same accepted dimensions through `TerminalCore.resize(cols, rows, widthPx, heightPx)` before adoption.
 
 WTerm honors synchronized output mode (CSI `?2026`) by painting the block atomically when the mode closes. Each synchronized block can hold rendering for at most one second from its opening sequence. Ordinary payload does not extend that deadline. If the deadline expires, WTerm resumes painting until a fresh synchronized block begins.
 

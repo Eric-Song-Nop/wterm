@@ -80,6 +80,15 @@ export interface GhosttyExports {
   ): number;
   encode_paste(ptr: number, data_ptr: number, data_len: number): number;
   encode_focus(ptr: number, gained: number): number;
+  encode_mouse(
+    ptr: number,
+    action: number,
+    button: number,
+    buttons: number,
+    modifiers: number,
+    x: number,
+    y: number,
+  ): number;
 
   // Render state
   update(ptr: number): number;
