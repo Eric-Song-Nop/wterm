@@ -445,6 +445,207 @@ describe("WTerm", () => {
     });
   });
 
+  describe("onRenderCommit", () => {
+    it("reports one commit for coalesced writes after local callbacks", async () => {
+      const frames: FrameRequestCallback[] = [];
+      const requestAnimationFrame = vi
+        .spyOn(globalThis, "requestAnimationFrame")
+        .mockImplementation((callback) => {
+          frames.push(callback);
+          return frames.length;
+        });
+      const events: string[] = [];
+      const onRenderCommit = vi.fn(() => events.push("commit"));
+      const term = new WTerm(element, {
+        autoResize: false,
+        onData: () => events.push("response"),
+        onTitle: () => events.push("title"),
+        onRenderCommit,
+      });
+      await term.init();
+      onRenderCommit.mockClear();
+      requestAnimationFrame.mockClear();
+      events.length = 0;
+      frames.length = 0;
+
+      term.write("a");
+      term.write("b");
+      vi.mocked(mockBridge.getTitle).mockReturnValue("ready");
+      vi.mocked(mockBridge.getResponse)
+        .mockReturnValueOnce("response")
+        .mockReturnValue(null);
+
+      expect(requestAnimationFrame).toHaveBeenCalledTimes(1);
+      frames[0](performance.now());
+
+      expect(onRenderCommit).toHaveBeenCalledOnce();
+      expect(events).toEqual(["title", "response", "commit"]);
+      term.destroy();
+    });
+
+    it("reports the synchronized block when its closing frame commits", async () => {
+      vi.useFakeTimers();
+      try {
+        vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation(
+          (callback) => {
+            setTimeout(() => callback(performance.now()), 0);
+            return 1;
+          },
+        );
+        let synchronized = false;
+        vi.mocked(mockBridge.synchronizedOutput).mockImplementation(
+          () => synchronized,
+        );
+        const onRenderCommit = vi.fn();
+        const term = new WTerm(element, {
+          autoResize: false,
+          onRenderCommit,
+        });
+        await term.init();
+        onRenderCommit.mockClear();
+
+        synchronized = true;
+        term.write("partial");
+        await vi.advanceTimersByTimeAsync(500);
+        expect(onRenderCommit).not.toHaveBeenCalled();
+
+        synchronized = false;
+        term.write("complete");
+        expect(onRenderCommit).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(onRenderCommit).toHaveBeenCalledOnce();
+        term.destroy();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("reports the synchronized block when its fallback commits", async () => {
+      vi.useFakeTimers();
+      try {
+        const requestAnimationFrame = vi
+          .spyOn(globalThis, "requestAnimationFrame")
+          .mockReturnValue(42);
+        vi.mocked(mockBridge.synchronizedOutput).mockReturnValue(true);
+        const onRenderCommit = vi.fn();
+        const term = new WTerm(element, {
+          autoResize: false,
+          onRenderCommit,
+        });
+        await term.init();
+        onRenderCommit.mockClear();
+        requestAnimationFrame.mockClear();
+
+        term.write("partial");
+        await vi.advanceTimersByTimeAsync(999);
+        expect(onRenderCommit).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+
+        expect(onRenderCommit).toHaveBeenCalledOnce();
+        expect(requestAnimationFrame).not.toHaveBeenCalled();
+        term.destroy();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("reports adoption only after the replacement is fully committed", async () => {
+      const onRenderCommit = vi.fn();
+      const term = new WTerm(element, {
+        autoResize: false,
+        onRenderCommit,
+      });
+      await term.init();
+      onRenderCommit.mockClear();
+      const nextCore = createMockBridge();
+      vi.mocked(nextCore.getCols).mockReturnValue(3);
+      vi.mocked(nextCore.getRows).mockReturnValue(2);
+      vi.mocked(nextCore.getCursor).mockReturnValue({
+        row: 0,
+        col: 0,
+        visible: false,
+      });
+      vi.mocked(nextCore.getCell).mockReturnValue({
+        char: 66,
+        fg: 256,
+        bg: 256,
+        flags: 0,
+      });
+      onRenderCommit.mockImplementation(() => {
+        expect(term.bridge).toBe(nextCore);
+        expect(element.querySelector(".term-grid")?.textContent).toContain("B");
+        expect(mockBridge.dispose).toHaveBeenCalledOnce();
+      });
+
+      term.adoptCore(nextCore);
+
+      expect(onRenderCommit).toHaveBeenCalledOnce();
+      term.destroy();
+    });
+
+    it("does not report a renderer failure", async () => {
+      const frames: FrameRequestCallback[] = [];
+      vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation(
+        (callback) => {
+          frames.push(callback);
+          return frames.length;
+        },
+      );
+      const onRenderCommit = vi.fn();
+      const term = new WTerm(element, {
+        autoResize: false,
+        onRenderCommit,
+      });
+      await term.init();
+      onRenderCommit.mockClear();
+      vi.spyOn(Renderer.prototype, "render").mockImplementationOnce(() => {
+        throw new Error("render failed");
+      });
+
+      term.write("data");
+
+      expect(() => frames[0](performance.now())).toThrow("render failed");
+      expect(onRenderCommit).not.toHaveBeenCalled();
+      term.destroy();
+    });
+
+    it("contains observer errors across renders and adoption", async () => {
+      const frames: FrameRequestCallback[] = [];
+      vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation(
+        (callback) => {
+          frames.push(callback);
+          return frames.length;
+        },
+      );
+      const render = vi.spyOn(Renderer.prototype, "render");
+      const onRenderCommit = vi.fn(() => {
+        throw new Error("observer failed");
+      });
+      const term = new WTerm(element, {
+        autoResize: false,
+        onRenderCommit,
+      });
+
+      await expect(term.init()).resolves.toBe(term);
+      term.write("before adoption");
+      expect(() => frames.shift()?.(performance.now())).not.toThrow();
+
+      const nextCore = createMockBridge();
+      vi.mocked(nextCore.getCols).mockReturnValue(3);
+      vi.mocked(nextCore.getRows).mockReturnValue(2);
+      expect(() => term.adoptCore(nextCore)).not.toThrow();
+      expect(term.bridge).toBe(nextCore);
+
+      term.write("after adoption");
+      expect(() => frames.shift()?.(performance.now())).not.toThrow();
+
+      expect(render).toHaveBeenCalledTimes(4);
+      expect(onRenderCommit).toHaveBeenCalledTimes(4);
+      term.destroy();
+      expect(nextCore.dispose).toHaveBeenCalledOnce();
+    });
+  });
+
   describe("adoptCore", () => {
     it("atomically adopts a pre-initialized core and releases it on destroy", async () => {
       const onData = vi.fn();

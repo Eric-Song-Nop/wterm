@@ -118,6 +118,10 @@ The React and Vue `<Terminal>` components and the vanilla `WTerm` constructor al
   </tbody>
 </table>
 
+### Vanilla render commits
+
+The vanilla `WTerm` constructor also accepts `onRenderCommit?: () => void`. It runs after every successful initial, scheduled, synchronized-output, or adopted-core render, once WTerm has completed its synchronous DOM, scroll, title, and response work. The callback observes a render commit, not browser paint. Observer errors are ignored, and an omitted callback adds no animation frame or timer scheduling.
+
 ## Semantic Input
 
 `InputSink` receives a transport-neutral `TerminalInputEvent` union:

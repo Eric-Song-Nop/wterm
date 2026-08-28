@@ -24,6 +24,7 @@ wterm ("dub-term") renders to the DOM — native text selection, copy/paste, fin
 - **Native hyperlinks** — OSC 8 links remain attached to their exact cells through viewport and scrollback, with safe HTTP(S) anchors
 - **Dirty-row tracking** — only touched rows are re-rendered each frame via `requestAnimationFrame`
 - **Frame-direct scheduling** — writes queue their render on the next animation frame without an extra timer hop
+- **Opt-in render commits** — vanilla WTerm can report completed synchronous render commits without treating them as browser paint
 - **Synchronized output** — mode 2026 blocks paint atomically with a bounded recovery deadline
 - **Themes** — CSS custom properties with built-in Default, Solarized Dark, Monokai, and Light themes
 - **Alternate screen buffer** — `vim`, `less`, `htop`, and similar apps work correctly

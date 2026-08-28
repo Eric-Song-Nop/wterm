@@ -27,6 +27,11 @@ interface WTermBaseOptions {
   debug?: boolean;
   onTitle?: (title: string) => void;
   onResize?: (cols: number, rows: number) => void;
+  /**
+   * Called after a successful renderer pass and WTerm's synchronous DOM and
+   * local-state commit. This reports a render commit, not browser paint.
+   */
+  onRenderCommit?: () => void;
 }
 
 export type WTermOptions = WTermBaseOptions &
@@ -53,6 +58,7 @@ export class WTerm {
 
   private _ownedCore: TerminalCore | null;
   private readonly _inputSink: InputSink | null;
+  private readonly _onRenderCommit: (() => void) | null;
   private wasmUrl: string | undefined;
   private _debugEnabled: boolean;
   private renderer: Renderer | null = null;
@@ -96,6 +102,7 @@ export class WTerm {
     this.element = element;
     this._ownedCore = options.core ?? null;
     this._inputSink = options.inputSink ?? null;
+    this._onRenderCommit = options.onRenderCommit ?? null;
     this.wasmUrl = options.wasmUrl;
     this.cols = options.cols || 80;
     this.rows = options.rows || 24;
@@ -398,6 +405,7 @@ export class WTerm {
     this.debug?.setBridge(core);
 
     previousCore.dispose();
+    if (this._onRenderCommit !== null) this._notifyRenderCommit();
   }
 
   /** Apply an authoritative grid and pixel size without emitting input. */
@@ -596,6 +604,15 @@ export class WTerm {
     }
 
     this._drainResponses();
+    if (this._onRenderCommit !== null) this._notifyRenderCommit();
+  }
+
+  private _notifyRenderCommit(): void {
+    try {
+      this._onRenderCommit!();
+    } catch {
+      // Observability must not affect rendering, adoption, or terminal lifetime.
+    }
   }
 
   private _drainResponses(): { hasError: boolean; error?: unknown } {

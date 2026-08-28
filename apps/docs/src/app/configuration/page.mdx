@@ -4,6 +4,8 @@
 
 The React and Vue `Terminal` components and the vanilla `WTerm` constructor accept the same core options — `cols`, `rows`, `core`, `wasmUrl`, `autoResize`, `cursorBlink`, and `debug` — plus `inputSink` and event callbacks `onData`, `onTitle`, and `onResize` (exposed as `@data`, `@title`, `@resize` events in Vue).
 
+Vanilla `WTerm` additionally accepts `onRenderCommit`, an opt-in observer that runs after each successful renderer pass and WTerm's synchronous local commit. It reports a render commit, not browser paint. Observer errors are contained, and omitting the hook does not add frame or timer scheduling.
+
 See the full [API Reference](/api-reference#terminal-options) for types, defaults, and descriptions.
 
 ### Raw and semantic input
