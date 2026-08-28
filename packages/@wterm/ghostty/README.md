@@ -150,6 +150,57 @@ Browser code should call `ghosttyKeyEventFromDom(event)` once and send the norma
 
 `encodeSnapshot()` is a point-in-time Ghostty checkpoint that includes the parser continuation. It does not replace the ordered PTY byte stream between checkpoints.
 
+### Passive snapshot restore
+
+Restore decodes the renderable READY prefix synchronously, then exposes one
+history PAGE per call. The normal cold-reconnect flow validates FINISH before
+applying transport bytes that followed the checkpoint:
+
+```ts
+const restore = runtime.beginPassiveRestore(snapshot, {
+  effects: "discard",
+  maxContinuationBytes: 64 * 1024,
+});
+
+await restore.advanceToFinish(); // yields to the event loop between pages
+restore.writeRaw(bytesAfterCheckpoint);
+const replica = restore.takeCore();
+restore.dispose();
+```
+
+For a latency-sensitive reconnect, `abandonHistory()` permanently drops the
+remaining decoder input before the transport tail is applied:
+
+```ts
+const restore = runtime.beginPassiveRestore(snapshot, {
+  effects: "discard",
+  maxContinuationBytes: 64 * 1024,
+});
+restore.abandonHistory();
+restore.writeRaw(bytesAfterCheckpoint);
+const replica = restore.takeCore();
+```
+
+`decodeNextHistory()` is the lower-level one-page primitive.
+`advanceToFinish({ signal })` converts cancellation into explicit history
+abandonment, leaving the READY terminal available for `writeRaw()` and
+`takeCore()`. A handle owns the terminal until `takeCore()` succeeds; transfer
+is allowed only after FINISH or explicit abandonment and can happen once.
+FINISH is accepted only when the bounded snapshot buffer is exhausted, so
+trailing bytes and concatenated snapshots fail integrity validation. Explicit
+`abandonHistory()` is the sole opt-out: it intentionally discards every
+unconsumed snapshot byte together with the remaining history.
+Restored terminals are permanently created with `effects: "discard"`, so
+continuation replay, history restore, resizing, and later PTY bytes cannot emit
+replies to the remote process.
+
+A WASM trap makes restore ownership unknowable. The handle atomically drops its
+native pointer, attempts best-effort cleanup, and caches a fatal
+`GhosttyRestoreError` with `status: "unknown"`; every later operation throws the
+same error and `takeCore()` is forbidden. A zero transfer allocation before a
+write and a typed `resizeFailure` remain retryable. A typed `mutationFailure`
+leaves the native restore in `failed` phase and must not be retried.
+
 ## Architecture
 
 The WASM binary is built from [Eric-Song-Nop/ghostty](https://github.com/Eric-Song-Nop/ghostty) commit `fe317f850c3ab212f6638122c459b9b48b99a016`, based on upstream commit `f2d5758f6305867dc36b36293c6165d8152b853e`. The fork commit fixes upstream's unreachable ANSI DECRQM dispatch and is reviewed in [Eric-Song-Nop/ghostty#1](https://github.com/Eric-Song-Nop/ghostty/pull/1). No build-time source rewrite, third-party npm package, or pre-built binary participates in the build.

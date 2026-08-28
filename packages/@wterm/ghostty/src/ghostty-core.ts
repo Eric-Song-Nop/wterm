@@ -9,7 +9,6 @@ import {
   type GhosttyWasmSource,
   GhosttyMutationError,
   GhosttyRenderError,
-  GhosttyRuntime,
   WASM_MUTATION_STATUS,
   assertMutationStatus,
   loadGhosttyWasm,
@@ -20,6 +19,7 @@ import {
   freeBuffer,
   CELL_BYTES,
 } from "./wasm-bindings.js";
+import type { GhosttyRuntime } from "./ghostty-runtime.js";
 
 const DEFAULT_COLOR = 256;
 const GRAPHEME_BUFFER_BYTES = 256;
@@ -287,6 +287,25 @@ export class GhosttyCore implements TerminalCore {
     options: Omit<GhosttyOptions, "wasmSource" | "wasmPath"> = {},
   ): GhosttyCore {
     return new GhosttyCore(runtime.wasm, options);
+  }
+
+  /** @internal Transfer one passive-restore State into a fully owned core. */
+  static _fromRestoredState(
+    runtime: GhosttyRuntime,
+    statePtr: number,
+  ): GhosttyCore {
+    const core = new GhosttyCore(runtime.wasm, { effects: "discard" });
+    try {
+      core._adoptRestoredState(statePtr);
+      return core;
+    } catch (error) {
+      try {
+        runtime.wasm.exports.deinit(statePtr);
+      } catch {
+        // Preserve the adoption error after best-effort State cleanup.
+      }
+      throw error;
+    }
   }
 
   // -- Lifecycle --
@@ -745,6 +764,43 @@ export class GhosttyCore implements TerminalCore {
   }
 
   // -- Internal helpers --
+
+  private _adoptRestoredState(statePtr: number): void {
+    if (statePtr === 0) {
+      throw new Error("@wterm/ghostty: passive restore returned no State");
+    }
+    const cols = this.wasm.exports.terminal_cols(statePtr);
+    const rows = this.wasm.exports.terminal_rows(statePtr);
+    let grid: GridBufferAllocation | undefined;
+    let graphemePtr = 0;
+    let hyperlinkPtr = 0;
+    try {
+      grid = this._allocateGridBuffers(cols, rows);
+      graphemePtr = this._allocateRequiredBuffer(
+        GRAPHEME_BUFFER_BYTES,
+        "grapheme",
+      );
+      hyperlinkPtr = this._allocateRequiredBuffer(
+        HYPERLINK_BUFFER_BYTES,
+        "hyperlink",
+      );
+    } catch (error) {
+      if (grid) this._releaseGridBuffers(grid);
+      this._releaseBuffer(graphemePtr, GRAPHEME_BUFFER_BYTES);
+      this._releaseBuffer(hyperlinkPtr, HYPERLINK_BUFFER_BYTES);
+      throw error;
+    }
+
+    this.termPtr = statePtr;
+    this._cols = cols;
+    this._rows = rows;
+    this._graphemeBufPtr = graphemePtr;
+    this._graphemeBufSize = GRAPHEME_BUFFER_BYTES;
+    this._hyperlinkBufPtr = hyperlinkPtr;
+    this._hyperlinkBufSize = HYPERLINK_BUFFER_BYTES;
+    this._installGridBuffers(grid);
+    this._invalidate();
+  }
 
   private _withTransfer<T>(
     byteLength: number,

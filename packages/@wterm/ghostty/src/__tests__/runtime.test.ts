@@ -11,7 +11,8 @@ import {
   GHOSTTY_ENGINE_ID,
   GHOSTTY_ENGINE_MANIFEST,
 } from "../engine.js";
-import { GhosttyMutationError, GhosttyRuntime } from "../wasm-bindings.js";
+import { GhosttyRuntime } from "../ghostty-runtime.js";
+import { GhosttyMutationError } from "../wasm-bindings.js";
 
 const wasmBytes = readFileSync(
   fileURLToPath(new URL("../../wasm/ghostty-vt.wasm", import.meta.url)),

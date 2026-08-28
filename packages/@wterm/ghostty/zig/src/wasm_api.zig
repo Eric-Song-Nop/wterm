@@ -16,6 +16,7 @@ const TerminalSize = @typeInfo(SizeCallbackReturn).optional.child;
 const DeviceAttributesCallbackPtr = @typeInfo(@FieldType(TerminalHandler.Effects, "device_attributes")).optional.child;
 const DeviceAttributesCallbackFn = @typeInfo(DeviceAttributesCallbackPtr).pointer.child;
 const DeviceAttributes = @typeInfo(DeviceAttributesCallbackFn).@"fn".return_type.?;
+const SnapshotDecoder = vt.snapshot.Decoder;
 
 const Allocator = std.mem.Allocator;
 const allocator = std.heap.wasm_allocator;
@@ -32,6 +33,27 @@ const MUTATION_EFFECT_OVERFLOW = 2;
 const MUTATION_RESIZE_FAILURE = 3;
 const RENDER_OK = 0;
 const RENDER_FAILURE = 1;
+const RESTORE_STATUS_OK = 0;
+const RESTORE_STATUS_INVALID_SNAPSHOT = 1;
+const RESTORE_STATUS_CONTINUATION_LIMIT = 2;
+const RESTORE_STATUS_OUT_OF_MEMORY = 3;
+const RESTORE_STATUS_INVALID_CONTINUATION = 4;
+const RESTORE_STATUS_INVALID_STATE = 5;
+const RESTORE_STATUS_MUTATION_FAILURE = 6;
+const RESTORE_STATUS_RESIZE_FAILURE = 7;
+
+const RestorePhase = enum(u32) {
+    ready = 1,
+    history = 2,
+    finish = 3,
+    abandoned = 4,
+    failed = 5,
+    taken = 6,
+};
+
+var live_state_count: u32 = 0;
+var live_restore_count: u32 = 0;
+var live_buffer_count: u32 = 0;
 
 fn isUnicodeScalar(value: u32) bool {
     return value <= 0x10FFFF and !(value >= 0xD800 and value <= 0xDFFF);
@@ -259,8 +281,66 @@ const State = struct {
     output: []u8,
 };
 
+const RestoreProgress = struct {
+    screen: u32 = 0,
+    rows: u32 = 0,
+    remaining: u32 = 0,
+};
+
+/// Owns every allocation involved in incremental restore until the State is
+/// explicitly transferred. The fixed reader and decoder point into this
+/// allocation, so the handle must never move.
+const RestoreHandle = struct {
+    snapshot: ?[]u8,
+    reader: std.Io.Reader,
+    decoder: SnapshotDecoder,
+    state: ?*State,
+    phase: RestorePhase,
+    status: u32,
+    progress: RestoreProgress,
+};
+
 fn stateFromPtr(ptr: usize) *State {
     return @ptrFromInt(ptr);
+}
+
+fn restoreFromPtr(ptr: usize) *RestoreHandle {
+    return @ptrFromInt(ptr);
+}
+
+fn deinitState(state: *State) void {
+    state.render.deinit(allocator);
+    state.stream.deinit();
+    state.terminal.deinit(allocator);
+    if (state.output.len > 0) allocator.free(state.output);
+    allocator.destroy(state);
+    live_state_count -= 1;
+}
+
+fn releaseRestoreSource(handle: *RestoreHandle) void {
+    if (handle.snapshot) |bytes| {
+        allocator.free(bytes);
+        handle.snapshot = null;
+    }
+}
+
+fn restoreStatusForError(err: anyerror) u32 {
+    return switch (err) {
+        error.OutOfMemory => RESTORE_STATUS_OUT_OF_MEMORY,
+        error.ContinuationLimitExceeded => RESTORE_STATUS_CONTINUATION_LIMIT,
+        error.InvalidContinuation,
+        error.ContinuationDisabled,
+        error.ContinuationUnavailable,
+        => RESTORE_STATUS_INVALID_CONTINUATION,
+        else => RESTORE_STATUS_INVALID_SNAPSHOT,
+    };
+}
+
+fn failRestore(handle: *RestoreHandle, err: anyerror) u32 {
+    handle.phase = .failed;
+    handle.status = restoreStatusForError(err);
+    handle.progress = .{};
+    return handle.status;
 }
 
 fn replaceOutput(state: *State, bytes: []u8) void {
@@ -282,8 +362,54 @@ fn writeContinuation(
     state: *const State,
     writer: *std.Io.Writer,
 ) bool {
-    state.stream.writeContinuation(writer) catch return false;
+    state.stream.writeContinuation(writer) catch |err| return switch (err) {
+        error.ContinuationDisabled => state.stream.ground(),
+        error.ContinuationUnavailable, error.WriteFailed => false,
+    };
     return true;
+}
+
+fn stateFromDecoded(
+    decoded: *vt.snapshot.Decoded,
+    continuation_max_bytes: usize,
+) !*State {
+    const state = try allocator.create(State);
+    live_state_count += 1;
+    state.terminal = decoded.toOwned();
+    state.effects = .{};
+    state.synchronized_output_generation = 0;
+    state.stream = .init(.{
+        .allocator = allocator,
+        .continuation_max_bytes = continuation_max_bytes,
+        .handler = .init(
+            &state.terminal,
+            &state.effects,
+            &state.synchronized_output_generation,
+            false,
+        ),
+    });
+    state.render = RenderState.empty;
+    state.output = &.{};
+    errdefer deinitState(state);
+
+    const continuation: []const u8 = switch (decoded.continuation) {
+        .ground => "",
+        .bytes => |bytes| bytes,
+    };
+    if (continuation.len > 0) state.stream.nextSlice(continuation);
+    if (state.stream.handler.inner.semantic_failure) {
+        return error.InvalidContinuation;
+    }
+
+    var replayed: std.Io.Writer.Allocating = .init(allocator);
+    defer replayed.deinit();
+    if (!writeContinuation(state, &replayed.writer)) {
+        return error.InvalidContinuation;
+    }
+    if (!std.mem.eql(u8, continuation, replayed.written())) {
+        return error.InvalidContinuation;
+    }
+    return state;
 }
 
 // -- Lifecycle --------------------------------------------------
@@ -297,6 +423,7 @@ export fn init(
     effects_mode: u32,
 ) usize {
     const state = allocator.create(State) catch return 0;
+    live_state_count += 1;
     state.terminal = Terminal.init((vt.TinyIo.init).io(), allocator, .{
         .cols = cols,
         .rows = rows,
@@ -319,6 +446,7 @@ export fn init(
         .default_modes = .{ .grapheme_cluster = true },
     }) catch {
         allocator.destroy(state);
+        live_state_count -= 1;
         return 0;
     };
     state.effects = .{};
@@ -339,12 +467,7 @@ export fn init(
 }
 
 export fn deinit(ptr: usize) void {
-    const state = stateFromPtr(ptr);
-    state.render.deinit(allocator);
-    state.stream.deinit();
-    state.terminal.deinit(allocator);
-    if (state.output.len > 0) allocator.free(state.output);
-    allocator.destroy(state);
+    deinitState(stateFromPtr(ptr));
 }
 
 export fn resize(ptr: usize, cols: u16, rows: u16, width_px: u32, height_px: u32) u32 {
@@ -430,6 +553,228 @@ export fn encode_snapshot(ptr: usize) u32 {
             .{ .bytes = continuation.written() } },
     ) catch return OUTPUT_ERROR;
     return finishOutput(state, &snapshot);
+}
+
+// -- Passive snapshot restore ---------------------------------
+
+/// Copy one complete snapshot into a heap-stable incremental decoder and
+/// synchronously decode through READY. A nonzero handle is returned even for
+/// decode failures so JS can inspect the typed status and dispose uniformly.
+export fn restore_begin(
+    data_ptr: [*]const u8,
+    data_len: u32,
+    max_continuation_bytes: u32,
+) usize {
+    const handle = allocator.create(RestoreHandle) catch return 0;
+    live_restore_count += 1;
+    handle.* = .{
+        .snapshot = null,
+        .reader = undefined,
+        .decoder = undefined,
+        .state = null,
+        .phase = .failed,
+        .status = RESTORE_STATUS_OUT_OF_MEMORY,
+        .progress = .{},
+    };
+
+    const snapshot = allocator.dupe(u8, data_ptr[0..data_len]) catch
+        return @intFromPtr(handle);
+    handle.snapshot = snapshot;
+    handle.reader = .fixed(snapshot);
+    handle.decoder = .init(&handle.reader);
+
+    var decoded = handle.decoder.ready(
+        allocator,
+        (vt.TinyIo.init).io(),
+        .{ .max_continuation_bytes = max_continuation_bytes },
+    ) catch |err| {
+        _ = failRestore(handle, err);
+        return @intFromPtr(handle);
+    };
+    defer decoded.deinit(allocator);
+
+    handle.state = stateFromDecoded(
+        &decoded,
+        max_continuation_bytes,
+    ) catch |err| {
+        _ = failRestore(handle, err);
+        return @intFromPtr(handle);
+    };
+    handle.phase = .ready;
+    handle.status = RESTORE_STATUS_OK;
+    return @intFromPtr(handle);
+}
+
+export fn restore_phase(ptr: usize) u32 {
+    return @intFromEnum(restoreFromPtr(ptr).phase);
+}
+
+export fn restore_status(ptr: usize) u32 {
+    return restoreFromPtr(ptr).status;
+}
+
+/// Consume and apply at most one PAGE record. Manifest and FINISH records may
+/// be consumed in the same call, but history work is never batched.
+export fn restore_next_history(ptr: usize) u32 {
+    const handle = restoreFromPtr(ptr);
+    switch (handle.phase) {
+        .ready, .history => {},
+        else => {
+            handle.status = RESTORE_STATUS_INVALID_STATE;
+            return handle.status;
+        },
+    }
+    const state = handle.state orelse {
+        handle.status = RESTORE_STATUS_INVALID_STATE;
+        return handle.status;
+    };
+    handle.progress = .{};
+
+    const progress = handle.decoder.next(
+        allocator,
+        &state.terminal,
+    ) catch |err| return failRestore(handle, err);
+    if (progress) |value| {
+        handle.phase = .history;
+        handle.status = RESTORE_STATUS_OK;
+        handle.progress = .{
+            .screen = if (value.key == .primary) 0 else 1,
+            .rows = @intCast(value.rows),
+            .remaining = value.remaining,
+        };
+        return RESTORE_STATUS_OK;
+    }
+
+    _ = handle.reader.peekByte() catch |err| switch (err) {
+        error.EndOfStream => {
+            releaseRestoreSource(handle);
+            handle.phase = .finish;
+            handle.status = RESTORE_STATUS_OK;
+            return RESTORE_STATUS_OK;
+        },
+        else => return failRestore(handle, err),
+    };
+    return failRestore(handle, error.TrailingData);
+}
+
+export fn restore_progress_screen(ptr: usize) u32 {
+    return restoreFromPtr(ptr).progress.screen;
+}
+
+export fn restore_progress_rows(ptr: usize) u32 {
+    return restoreFromPtr(ptr).progress.rows;
+}
+
+export fn restore_progress_remaining(ptr: usize) u32 {
+    return restoreFromPtr(ptr).progress.remaining;
+}
+
+/// Stop consuming history without invalidating the READY terminal. This is an
+/// explicit integrity tradeoff and permanently releases the decoder input.
+export fn restore_abandon_history(ptr: usize) u32 {
+    const handle = restoreFromPtr(ptr);
+    switch (handle.phase) {
+        .ready, .history => {},
+        else => {
+            handle.status = RESTORE_STATUS_INVALID_STATE;
+            return handle.status;
+        },
+    }
+    releaseRestoreSource(handle);
+    handle.phase = .abandoned;
+    handle.status = RESTORE_STATUS_OK;
+    handle.progress = .{};
+    return RESTORE_STATUS_OK;
+}
+
+fn restoreTailState(handle: *RestoreHandle) ?*State {
+    switch (handle.phase) {
+        .finish, .abandoned => {},
+        else => {
+            handle.status = RESTORE_STATUS_INVALID_STATE;
+            return null;
+        },
+    }
+    return handle.state orelse {
+        handle.status = RESTORE_STATUS_INVALID_STATE;
+        return null;
+    };
+}
+
+export fn restore_write(
+    ptr: usize,
+    data_ptr: [*]const u8,
+    data_len: u32,
+) u32 {
+    const handle = restoreFromPtr(ptr);
+    const state = restoreTailState(handle) orelse return handle.status;
+    state.stream.nextSlice(data_ptr[0..data_len]);
+    if (state.stream.handler.inner.semantic_failure) {
+        handle.phase = .failed;
+        handle.status = RESTORE_STATUS_MUTATION_FAILURE;
+        return handle.status;
+    }
+    handle.status = RESTORE_STATUS_OK;
+    return RESTORE_STATUS_OK;
+}
+
+export fn restore_resize(
+    ptr: usize,
+    cols: u16,
+    rows: u16,
+    width_px: u32,
+    height_px: u32,
+) u32 {
+    const handle = restoreFromPtr(ptr);
+    const state = restoreTailState(handle) orelse return handle.status;
+    if (cols == 0 or rows == 0) {
+        handle.status = RESTORE_STATUS_RESIZE_FAILURE;
+        return handle.status;
+    }
+    const cell_size: @FieldType(Terminal.Resize, "cell_size_px") = if (width_px > 0 and height_px > 0) .{
+        .width = @max(1, width_px / cols),
+        .height = @max(1, height_px / rows),
+    } else null;
+    state.stream.handler.inner.resize(.{
+        .cols = cols,
+        .rows = rows,
+        .cell_size_px = cell_size,
+    }) catch {
+        handle.status = RESTORE_STATUS_RESIZE_FAILURE;
+        return handle.status;
+    };
+    handle.status = RESTORE_STATUS_OK;
+    return RESTORE_STATUS_OK;
+}
+
+/// Transfer the restored State exactly once. Only validated FINISH or an
+/// explicit history abandonment permits ownership transfer.
+export fn restore_take_state(ptr: usize) usize {
+    const handle = restoreFromPtr(ptr);
+    switch (handle.phase) {
+        .finish, .abandoned => {},
+        else => {
+            handle.status = RESTORE_STATUS_INVALID_STATE;
+            return 0;
+        },
+    }
+    const state = handle.state orelse {
+        handle.status = RESTORE_STATUS_INVALID_STATE;
+        return 0;
+    };
+    handle.state = null;
+    handle.phase = .taken;
+    handle.status = RESTORE_STATUS_OK;
+    releaseRestoreSource(handle);
+    return @intFromPtr(state);
+}
+
+export fn restore_deinit(ptr: usize) void {
+    const handle = restoreFromPtr(ptr);
+    if (handle.state) |state| deinitState(state);
+    releaseRestoreSource(handle);
+    allocator.destroy(handle);
+    live_restore_count -= 1;
 }
 
 // -- Semantic input encoding -----------------------------------
@@ -890,6 +1235,14 @@ export fn get_rows(ptr: usize) u32 {
     return state.render.rows;
 }
 
+export fn terminal_cols(ptr: usize) u32 {
+    return stateFromPtr(ptr).terminal.cols;
+}
+
+export fn terminal_rows(ptr: usize) u32 {
+    return stateFromPtr(ptr).terminal.rows;
+}
+
 // -- Scrollback -------------------------------------------------
 
 export fn get_scrollback_count(ptr: usize) u32 {
@@ -998,10 +1351,26 @@ export fn read_response(ptr: usize, buf_ptr: [*]u8, buf_len: u32) u32 {
 
 export fn alloc_buffer(len: u32) usize {
     const buf = allocator.alloc(u8, len) catch return 0;
+    live_buffer_count += 1;
     return @intFromPtr(buf.ptr);
 }
 
 export fn free_buffer(buf_ptr: usize, len: u32) void {
     const slice: [*]u8 = @ptrFromInt(buf_ptr);
     allocator.free(slice[0..len]);
+    live_buffer_count -= 1;
+}
+
+/// Observable ownership counters used by lifecycle stress tests and runtime
+/// diagnostics. They count live adapter objects, not allocator internals.
+export fn live_restore_handles() u32 {
+    return live_restore_count;
+}
+
+export fn live_terminal_states() u32 {
+    return live_state_count;
+}
+
+export fn live_bridge_buffers() u32 {
+    return live_buffer_count;
 }
