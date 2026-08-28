@@ -11,6 +11,8 @@ const state = vi.hoisted(() => {
     memory: new WebAssembly.Memory({ initial: 1 }),
     line: null as Uint8Array | null,
     lineLen: 0,
+    deinit: vi.fn(),
+    freeBuffer: vi.fn(),
   };
 });
 
@@ -22,11 +24,12 @@ vi.mock("../wasm-bindings.js", async () => {
   const exports = {
     memory: state.memory,
     init: () => 1,
+    deinit: state.deinit,
     resize: () => {},
     // 0 is treated as an allocation failure by ghostty-core.ts, so the
     // fake pointer must be nonzero.
     alloc_buffer: () => 64,
-    free_buffer: () => {},
+    free_buffer: state.freeBuffer,
     get_scrollback_line: (
       _ptr: number,
       _offset: number,
@@ -133,5 +136,49 @@ describe("GhosttyCore input modes", () => {
     expect(core.mouseTracking()).toBe(1002);
     expect(core.mouseSgr()).toBe(true);
     expect(core.focusEvents()).toBe(true);
+  });
+});
+
+describe("GhosttyCore lifecycle", () => {
+  beforeEach(() => {
+    state.deinit.mockReset();
+    state.freeBuffer.mockReset();
+  });
+
+  it("releases its terminal and persistent buffers exactly once", async () => {
+    const core = await GhosttyCore.load();
+    core.init(80, 24);
+
+    core.dispose();
+    core.dispose();
+
+    expect(state.deinit).toHaveBeenCalledOnce();
+    expect(state.deinit).toHaveBeenCalledWith(1);
+    expect(state.freeBuffer).toHaveBeenCalledTimes(4);
+    expect(state.freeBuffer.mock.calls.map(([, size]) => size)).toEqual([
+      80 * 24 * CELL_BYTES,
+      80 * CELL_BYTES,
+      256,
+      1024,
+    ]);
+  });
+
+  it("continues releasing resources when WASM cleanup traps", async () => {
+    const core = await GhosttyCore.load();
+    core.init(80, 24);
+    state.freeBuffer.mockImplementationOnce(() => {
+      throw new Error("free trapped");
+    });
+    state.deinit.mockImplementationOnce(() => {
+      throw new Error("deinit trapped");
+    });
+
+    expect(() => core.dispose()).not.toThrow();
+    core.dispose();
+
+    expect(state.freeBuffer).toHaveBeenCalledTimes(4);
+    expect(state.deinit).toHaveBeenCalledOnce();
+    expect(core.getCols()).toBe(0);
+    expect(core.getRows()).toBe(0);
   });
 });

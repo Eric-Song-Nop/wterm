@@ -65,7 +65,7 @@ The React and Vue `<Terminal>` components and the vanilla `WTerm` constructor al
       <td><code>core</code></td>
       <td><code>TerminalCore</code></td>
       <td>—</td>
-      <td>A pre-constructed terminal core instance. When provided, <code>wasmUrl</code> is ignored and this core is used instead of loading the built-in Zig WASM binary. See <a href="/ghostty">Ghostty Core</a> for an example.</td>
+      <td>A pre-constructed terminal core instance owned by WTerm. When provided, <code>wasmUrl</code> is ignored. WTerm disposes the core when replaced or destroyed. See <a href="/ghostty">Ghostty Core</a> for an example.</td>
     </tr>
     <tr>
       <td><code>wasmUrl</code></td>
@@ -232,12 +232,16 @@ Outside synchronized output, writes request the next animation frame directly. W
       <td>Resize the terminal grid</td>
     </tr>
     <tr>
+      <td><code>adoptCore(core)</code></td>
+      <td>Atomically adopt an already initialized core after staging its first frame. A failed adoption leaves the current core active. The viewport preserves bottom-following or its clamped distance from the bottom.</td>
+    </tr>
+    <tr>
       <td><code>focus()</code></td>
       <td>Focus the terminal input</td>
     </tr>
     <tr>
       <td><code>destroy()</code></td>
-      <td>Clean up event listeners, observers, and DOM</td>
+      <td>Dispose the active core and clean up event listeners, observers, and DOM</td>
     </tr>
   </tbody>
 </table>

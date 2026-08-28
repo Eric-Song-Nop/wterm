@@ -4,6 +4,7 @@ import type { WasmBridge } from "@wterm/core";
 function createMockBridge(): WasmBridge {
   return {
     init: vi.fn(),
+    dispose: vi.fn(),
     writeString: vi.fn(),
     writeRaw: vi.fn(),
     resize: vi.fn(),
@@ -253,6 +254,50 @@ describe("WTerm", () => {
       expect(result).toBe(term);
     });
 
+    it("rejects a second init without destroying the active terminal", async () => {
+      const term = new WTerm(element, { autoResize: false });
+      await term.init();
+      const container = element.querySelector(".term-grid");
+
+      await expect(term.init()).rejects.toThrow(
+        "wterm: terminal is already initialized",
+      );
+
+      expect(mockBridge.init).toHaveBeenCalledOnce();
+      expect(mockBridge.dispose).not.toHaveBeenCalled();
+      expect(term.bridge).toBe(mockBridge);
+      expect(element.querySelector(".term-grid")).toBe(container);
+
+      term.destroy();
+      expect(mockBridge.dispose).toHaveBeenCalledOnce();
+    });
+
+    it("rejects a concurrent init without disrupting the first", async () => {
+      let resolveLoad: (bridge: WasmBridge) => void;
+      vi.mocked(MockedWasmBridge.load).mockClear();
+      vi.mocked(MockedWasmBridge.load).mockReturnValue(
+        new Promise((resolve) => {
+          resolveLoad = resolve;
+        }),
+      );
+      const term = new WTerm(element, { autoResize: false });
+
+      const firstInit = term.init();
+      await expect(term.init()).rejects.toThrow(
+        "wterm: terminal is already initialized",
+      );
+      resolveLoad!(mockBridge);
+      await firstInit;
+
+      expect(MockedWasmBridge.load).toHaveBeenCalledOnce();
+      expect(mockBridge.init).toHaveBeenCalledOnce();
+      expect(mockBridge.dispose).not.toHaveBeenCalled();
+      expect(term.bridge).toBe(mockBridge);
+
+      term.destroy();
+      expect(mockBridge.dispose).toHaveBeenCalledOnce();
+    });
+
     it("creates row elements in the container", async () => {
       const term = new WTerm(element);
       await term.init();
@@ -294,6 +339,7 @@ describe("WTerm", () => {
       await initPromise;
 
       expect(mockBridge.init).not.toHaveBeenCalled();
+      expect(mockBridge.dispose).toHaveBeenCalledOnce();
     });
   });
 
@@ -345,6 +391,118 @@ describe("WTerm", () => {
       callbacks[0](performance.now());
       expect(mockBridge.clearDirty).toHaveBeenCalledTimes(2);
     });
+  });
+
+  describe("adoptCore", () => {
+    it("atomically adopts a pre-initialized core and releases it on destroy", async () => {
+      const onData = vi.fn();
+      const onResize = vi.fn();
+      const term = new WTerm(element, {
+        autoResize: false,
+        onData,
+        onResize,
+      });
+      await term.init();
+      const nextCore = createMockBridge();
+      vi.mocked(nextCore.getCols).mockReturnValue(3);
+      vi.mocked(nextCore.getRows).mockReturnValue(2);
+      vi.mocked(nextCore.getCursor).mockReturnValue({
+        row: 0,
+        col: 0,
+        visible: false,
+      });
+      vi.mocked(nextCore.getCell).mockReturnValue({
+        char: 66,
+        fg: 256,
+        bg: 256,
+        flags: 0,
+      });
+      const previousHeight = Number.parseFloat(element.style.height);
+
+      term.adoptCore(nextCore);
+
+      expect(term.bridge).toBe(nextCore);
+      expect(term.cols).toBe(3);
+      expect(term.rows).toBe(2);
+      expect(nextCore.init).not.toHaveBeenCalled();
+      expect(mockBridge.dispose).toHaveBeenCalledOnce();
+      expect(nextCore.dispose).not.toHaveBeenCalled();
+      expect(element.querySelectorAll(".term-grid")).toHaveLength(1);
+      expect(element.querySelector(".term-grid")?.textContent).toContain("B");
+      expect(Number.parseFloat(element.style.height)).toBeLessThan(
+        previousHeight,
+      );
+      expect(onData).not.toHaveBeenCalled();
+      expect(onResize).not.toHaveBeenCalled();
+
+      term.destroy();
+      expect(nextCore.dispose).toHaveBeenCalledOnce();
+    });
+
+    it("keeps the active core and DOM when staging the replacement fails", async () => {
+      const term = new WTerm(element, { autoResize: false });
+      await term.init();
+      const previousContainer = element.querySelector(".term-grid");
+      const previousHtml = previousContainer?.innerHTML;
+      const nextCore = createMockBridge();
+      vi.mocked(nextCore.getCols).mockReturnValue(2);
+      vi.mocked(nextCore.getRows).mockReturnValue(1);
+      vi.mocked(nextCore.getCell).mockImplementation(() => {
+        throw new Error("render failed");
+      });
+
+      expect(() => term.adoptCore(nextCore)).toThrow("render failed");
+
+      expect(term.bridge).toBe(mockBridge);
+      expect(term.cols).toBe(80);
+      expect(term.rows).toBe(24);
+      expect(element.querySelector(".term-grid")).toBe(previousContainer);
+      expect(previousContainer?.innerHTML).toBe(previousHtml);
+      expect(mockBridge.dispose).not.toHaveBeenCalled();
+      expect(nextCore.dispose).not.toHaveBeenCalled();
+
+      term.destroy();
+      nextCore.dispose();
+    });
+
+    it.each([
+      ["history grows", 2000, 1700],
+      ["history shrinks past the retained distance", 250, 0],
+    ])(
+      "preserves distance from the bottom when %s",
+      async (_label, nextScrollHeight, expectedScrollTop) => {
+        const nextCore = createMockBridge();
+        vi.mocked(nextCore.getCols).mockReturnValue(3);
+        vi.mocked(nextCore.getRows).mockReturnValue(2);
+        vi.mocked(nextCore.getScrollbackCount).mockReturnValue(100);
+        let term: WTerm | undefined;
+        let actualScrollTop = 0;
+        Object.defineProperty(element, "clientHeight", {
+          configurable: true,
+          value: 100,
+        });
+        Object.defineProperty(element, "scrollHeight", {
+          configurable: true,
+          get: () => (term?.bridge === nextCore ? nextScrollHeight : 1000),
+        });
+        Object.defineProperty(element, "scrollTop", {
+          configurable: true,
+          get: () => actualScrollTop,
+          set: (value: number) => {
+            const height = term?.bridge === nextCore ? nextScrollHeight : 1000;
+            actualScrollTop = Math.max(0, Math.min(value, height - 100));
+          },
+        });
+        term = new WTerm(element, { autoResize: false });
+        await term.init();
+        element.scrollTop = 700;
+
+        term.adoptCore(nextCore);
+
+        expect(element.scrollTop).toBe(expectedScrollTop);
+        term.destroy();
+      },
+    );
   });
 
   describe("resize", () => {
@@ -1276,6 +1434,22 @@ describe("WTerm", () => {
       term.destroy();
       term.destroy();
       expect(element.innerHTML).toBe("");
+      expect(mockBridge.dispose).toHaveBeenCalledOnce();
+      expect(term.bridge).toBeNull();
+    });
+
+    it("owns and releases a provided core before initialization", () => {
+      const providedCore = createMockBridge();
+      const term = new WTerm(element, {
+        autoResize: false,
+        core: providedCore,
+      });
+
+      term.destroy();
+      term.destroy();
+
+      expect(providedCore.init).not.toHaveBeenCalled();
+      expect(providedCore.dispose).toHaveBeenCalledOnce();
     });
   });
 });
