@@ -58,7 +58,7 @@ const term = new WTerm(document.getElementById("terminal"), {
 
 ## Options and Methods
 
-The `WTerm` constructor accepts all [shared terminal options](/api-reference#terminal-options) (`cols`, `rows`, `core`, `wasmUrl`, `autoResize`, `cursorBlink`, `onData`, `inputSink`, `onTitle`, `onResize`). Pass a [`TerminalCore`](/ghostty) instance to the `core` option to use an alternative emulation backend.
+The `WTerm` constructor accepts all [shared terminal options](/api-reference#terminal-options) (`cols`, `rows`, `core`, `wasmUrl`, `autoResize`, `cursorBlink`, `onData`, `inputSink`, `onTitle`, `onResize`). Vanilla WTerm also accepts [`onRenderCommit`](/api-reference#vanilla-render-commits) for observing a completed synchronous render commit without claiming browser paint. Pass a [`TerminalCore`](/ghostty) instance to the `core` option to use an alternative emulation backend.
 
 See [WTerm Methods](/api-reference#wterm-methods) for the full list of instance methods (`init`, `write`, `resize`, `focus`, `destroy`).
 

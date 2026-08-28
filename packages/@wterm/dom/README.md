@@ -51,6 +51,7 @@ new WTerm(element: HTMLElement, options?: WTermOptions)
 | `inputSink` | `InputSink` | — | Semantic browser intent for a remote authority. Mutually exclusive with `onData`. |
 | `onTitle` | `(title: string) => void` | — | Called when the terminal title changes |
 | `onResize` | `(cols: number, rows: number) => void` | — | Called on resize |
+| `onRenderCommit` | `() => void` | — | Called after a successful render and WTerm's synchronous local commit. This does not report browser paint. |
 
 **Methods:**
 
@@ -87,6 +88,8 @@ Mouse events include surface pixels plus locally observed cell and viewport geom
 WTerm honors synchronized output mode (CSI `?2026`) by painting the block atomically when the mode closes. Each synchronized block can hold rendering for at most one second from its opening sequence. Ordinary payload does not extend that deadline. If the deadline expires, WTerm resumes painting until a fresh synchronized block begins.
 
 Ordinary writes schedule `requestAnimationFrame` directly. Multiple writes before the frame are coalesced into one render.
+
+`onRenderCommit` observes each successful initial, scheduled, synchronized-output, or adopted-core render after WTerm has finished its synchronous DOM, scroll, title, and response work. Observer errors are ignored so diagnostics cannot disrupt the terminal. The hook does not mean the browser has painted pixels, and omitting it adds no frame or timer scheduling.
 
 When a terminal core supplies `CellData.chars`, the renderer paints that complete grapheme string instead of only the cell's base code point.
 
