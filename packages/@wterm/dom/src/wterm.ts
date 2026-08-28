@@ -408,6 +408,7 @@ export class WTerm {
     heightPx?: number,
   ): void {
     if (!this.bridge) return;
+    const gridChanged = cols !== this.cols || rows !== this.rows;
     this._shouldScrollToBottom =
       this._pendingResizeScrollTop === null && this._isScrolledToBottom();
     this.cols = cols;
@@ -420,9 +421,9 @@ export class WTerm {
     const synchronized = this.bridge.synchronizedOutput?.() ?? false;
     const generation = this.bridge.synchronizedOutputGeneration?.() ?? 0;
     if (this._updateSynchronizedOutput(synchronized, generation)) {
-      this._rendererNeedsSetup = true;
+      if (gridChanged) this._rendererNeedsSetup = true;
     } else {
-      this._setupRenderer(cols, rows);
+      if (gridChanged) this._setupRenderer(cols, rows);
       this._scheduleRender();
     }
     if (this.onResize) this.onResize(cols, rows);
