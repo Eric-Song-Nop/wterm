@@ -8,7 +8,7 @@ The core exposes SGR mouse tracking (modes 1000, 1002, and 1006), focus reportin
 Combining marks and ZWJ emoji are exposed through `CellData.chars` as complete strings, including after their rows move into scrollback.
 Native OSC 8 hyperlinks are resolved from Ghostty's page-owned metadata and exposed through `CellData.linkUri`, `CellData.linkId`, and `CellData.linkKey` in both the viewport and scrollback.
 
-Ghostty also exposes the cumulative number of rows discarded from the oldest end of scrollback. `@wterm/dom` uses that signal to keep retained history anchored when the page budget rolls over.
+The pinned Ghostty revision does not expose a cumulative discarded-row counter. The optional `TerminalCore.getScrollbackDiscardedCount()` signal is therefore omitted instead of returning a misleading retained-row value. A future Ghostty fork accessor must be included in the exact engine identity before restoring that API.
 
 ## Install
 
@@ -65,12 +65,14 @@ const core = await GhosttyCore.load();
 
 `GhosttyCore.load()` accepts an options object:
 
-| Option | Type | Description |
-|---|---|---|
-| `wasmPath` | `string` | Custom path to the ghostty-vt WASM binary |
-| `scrollbackLimit` | `number` | Scrollback budget in bytes, not lines (default: 10000). ghostty allocates history in pages, so the retained row count depends on the terminal width |
-| `foregroundColor` | `string` | Foreground reported by OSC 10 in `#RRGGBB` format (default: `#d4d4d4`) |
-| `backgroundColor` | `string` | Background reported by OSC 11 in `#RRGGBB` format (default: `#1e1e1e`) |
+| Option            | Type                                                  | Description                                                                                                             |
+| ----------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `wasmSource`      | `string \| URL \| BufferSource \| WebAssembly.Module` | WASM input for browsers, Node.js, and precompiled-module caches                                                         |
+| `wasmPath`        | `string`                                              | Deprecated URL/path alias for `wasmSource`                                                                              |
+| `scrollbackLimit` | `number`                                              | Scrollback memory budget in bytes (default: 10000)                                                                      |
+| `foregroundColor` | `string`                                              | Foreground reported by OSC 10 in `#RRGGBB` format (default: `#d4d4d4`)                                                  |
+| `backgroundColor` | `string`                                              | Background reported by OSC 11 in `#RRGGBB` format (default: `#1e1e1e`)                                                  |
+| `effects`         | `"authority" \| "discard"`                            | Enable bounded `WRITE_PTY` effects for a Host authority or suppress them for a browser replica (default: `"authority"`) |
 
 When using a custom CSS theme, pass matching foreground and background colors so terminal applications receive the colors they are actually rendered with:
 
@@ -85,11 +87,11 @@ const core = await GhosttyCore.load({
 
 The WASM binary is fetched at runtime, not inlined, so the default has to resolve to a URL your app actually serves. `GhosttyCore.load()` resolves it with `new URL("../wasm/ghostty-vt.wasm", import.meta.url)`. Bundlers that implement that asset pattern emit the binary and rewrite the URL; ones that do not leave `import.meta.url` pointing at the machine that built the bundle.
 
-| Bundler | Default `GhosttyCore.load()` | Verified |
-|---|---|---|
-| Vite (dev and build) | works, emits a hashed asset | yes |
-| Bun dev server | fails, pass `wasmPath` | yes |
-| Others | untested, use `wasmPath` if the default throws | no |
+| Bundler              | Default `GhosttyCore.load()`                   | Verified |
+| -------------------- | ---------------------------------------------- | -------- |
+| Vite (dev and build) | works, emits a hashed asset                    | yes      |
+| Bun dev server       | fails, pass `wasmPath`                         | yes      |
+| Others               | untested, use `wasmPath` if the default throws | no       |
 
 When the default cannot work, serve the binary yourself and point at it:
 
@@ -109,27 +111,64 @@ import wasmPath from "@wterm/ghostty/ghostty-vt.wasm?url";
 const core = await GhosttyCore.load({ wasmPath });
 ```
 
+### Shared Node.js runtime
+
+Node.js can compile the committed bytes once and create multiple terminal cores in the same WASM instance:
+
+```ts
+import { readFile } from "node:fs/promises";
+import { GhosttyCore, GhosttyRuntime } from "@wterm/ghostty";
+
+const bytes = await readFile(new URL("./ghostty-vt.wasm", import.meta.url));
+const runtime = await GhosttyRuntime.load(bytes);
+const authority = GhosttyCore.fromRuntime(runtime, { effects: "authority" });
+const replica = GhosttyCore.fromRuntime(runtime, { effects: "discard" });
+```
+
+`runtime.engineId` is generated from canonical build provenance: the exact Ghostty source tree and commit, snapshot schema digest, adapter ABI and source, feature/build profile, patchset, Zig version, and the committed WASM SHA-256. Snapshot exchange must require exact equality. `GHOSTTY_TERMINAL_PROFILE.term` is the fixed `xterm-256color` value the Host must also place in the child process environment.
+
+URL and `BufferSource` loads verify the raw artifact digest and expose `runtime.artifactVerified === true`. A bare `WebAssembly.Module` cannot be serialized by the Web API, so that path verifies only its embedded source build ID and reports `artifactVerified === false`; passing one is an explicit trust assertion by the caller or module cache.
+
+### Authority primitives
+
+The same core exposes the protocol boundary needed by a remote terminal host:
+
+```ts
+const keyBytes = authority.encodeKey({ key: "ArrowUp" });
+const pasteBytes = authority.encodePaste("hello\n");
+const focusBytes = authority.encodeFocus(true);
+
+authority.writeRaw(ptyOutput);
+const ptyReplies = authority.drainEffects();
+const checkpoint = authority.encodeSnapshot();
+const continuation = authority.getContinuation();
+```
+
+Browser code should call `ghosttyKeyEventFromDom(event)` once and send the normalized object unchanged. The helper selects a non-empty physical `KeyboardEvent.code` (falling back to the logical key), preserves UTF-8 `text`, action, AltGraph, composition, and consumed-modifier metadata, and removes the synthetic Ctrl+Alt pair browsers report for AltGraph text. The Host passes those fields directly to `encodeKey()`; it must not implement a second normalization path.
+
+`drainEffects()` returns binary `WRITE_PTY` frames in production order. The queue is bounded to 256 frames and 64 KiB; a write that overflows it throws `GhosttyMutationError` with `mutationCommitted: true` and `fatal: true`, increments `getEffectStats()`, and poisons the core. The Host must drain diagnostics, terminate the session, and rebuild from a new PTY. It must never retry that write because Ghostty already applied it.
+
+`encodeSnapshot()` is a point-in-time Ghostty checkpoint that includes the parser continuation. It does not replace the ordered PTY byte stream between checkpoints.
+
 ## Architecture
 
-The WASM binary is built from upstream [ghostty-org/ghostty](https://github.com/ghostty-org/ghostty) (v1.3.1) using it as a Zig package dependency — no third-party npm packages or pre-built binaries from other projects.
+The WASM binary is built from [Eric-Song-Nop/ghostty](https://github.com/Eric-Song-Nop/ghostty) commit `fe317f850c3ab212f6638122c459b9b48b99a016`, based on upstream commit `f2d5758f6305867dc36b36293c6165d8152b853e`. The fork commit fixes upstream's unreachable ANSI DECRQM dispatch and is reviewed in [Eric-Song-Nop/ghostty#1](https://github.com/Eric-Song-Nop/ghostty/pull/1). No build-time source rewrite, third-party npm package, or pre-built binary participates in the build.
 
 ```
-ghostty (Zig dep)  →  WASM patches  →  wasm_api.zig (~300 LOC)  →  ghostty-vt.wasm  →  TypeScript bindings
+ghostty (exact Zig dep)  →  wasm_api.zig  →  ghostty-vt.wasm  →  TypeScript runtime
 ```
 
-ghostty's `Terminal` and `Page` types use `posix.mmap` and Mach VM allocators internally, which don't exist on `wasm32-freestanding`. The build script applies small, targeted patches to replace these with `std.heap.wasm_allocator` and expose the discarded-row count from `PageList` (see `scripts/patch-ghostty-wasm.sh`). The patches are pinned to ghostty v1.3.1 and only touch two files: `page.zig` and `PageList.zig`.
-
-The committed `wasm/ghostty-vt.wasm` binary means consumers never need Zig installed. Only maintainers rebuilding the WASM need Zig 0.15.x.
+The committed `wasm/ghostty-vt.wasm` binary means consumers never need Zig installed. Only maintainers rebuilding the WASM need Zig 0.16.0.
 
 ### Rebuilding the WASM
 
-Requires [Zig 0.15.x](https://ziglang.org/download/) (ghostty's required version):
+Requires [Zig 0.16.0](https://ziglang.org/download/):
 
 ```bash
 pnpm --filter @wterm/ghostty rebuild-wasm
 ```
 
-This fetches the ghostty source via Zig's package manager, applies WASM compatibility patches, compiles our export layer to `wasm32-freestanding`, and copies the binary to `wasm/`.
+This fetches the exact Ghostty source via Zig's package manager, generates the embedded source build ID, compiles the export layer to `wasm32-freestanding`, copies the binary to `wasm/`, and generates `engine-manifest.json` plus the TypeScript identity exports. Package tests fail if any source, dependency, generated file, or committed WASM digest is stale.
 
 If the host toolchain cannot build, run the same script in a Linux container:
 
@@ -137,25 +176,23 @@ If the host toolchain cannot build, run the same script in a Linux container:
 pnpm --filter @wterm/ghostty rebuild-wasm:docker
 ```
 
-Zig 0.15.x cannot link a native build runner on macOS 26, and Zig 0.16 fails inside ghostty's vendored build files, so neither drives `rebuild-wasm` there. The wasm target itself is unaffected. Container output is byte-identical to a host build.
-
 ### Upgrading ghostty
 
-1. Edit the URL tag in `zig/build.zig.zon` to the new ghostty version
+1. Edit the exact commit URL in `zig/build.zig.zon`
 2. Run `zig fetch <new-url>` from the `zig/` directory to get the new hash
 3. Update the hash in `build.zig.zon`
-4. Verify the patches in `scripts/patch-ghostty-wasm.sh` still apply cleanly
-5. Run `pnpm --filter @wterm/ghostty rebuild-wasm`
+4. Run `pnpm --filter @wterm/ghostty rebuild-wasm`; the build generates every engine identity artifact
+5. Run the package tests and commit the Zig pin, adapter changes, generated manifest, and WASM together
 
 ## Tradeoffs vs built-in core
 
-| | Built-in (default) | `@wterm/ghostty` |
-|---|---|---|
-| Bundle size | ~12 KB WASM | ~400 KB WASM |
-| VT compliance | Basic VT100/VT220/xterm | Comprehensive |
-| Unicode | Single codepoints | Full grapheme clusters |
-| Dependencies | None | None (WASM built from source) |
-| Setup | Zero-config | Requires `@wterm/ghostty` install |
+|               | Built-in (default)      | `@wterm/ghostty`                  |
+| ------------- | ----------------------- | --------------------------------- |
+| Bundle size   | ~12 KB WASM             | ~600 KB WASM                      |
+| VT compliance | Basic VT100/VT220/xterm | Comprehensive                     |
+| Unicode       | Single codepoints       | Full grapheme clusters            |
+| Dependencies  | None                    | None (WASM built from source)     |
+| Setup         | Zero-config             | Requires `@wterm/ghostty` install |
 
 ## License
 

@@ -6,6 +6,12 @@ import type {
 } from "@wterm/core";
 import {
   type GhosttyWasm,
+  type GhosttyWasmSource,
+  GhosttyMutationError,
+  GhosttyRenderError,
+  GhosttyRuntime,
+  WASM_MUTATION_STATUS,
+  assertMutationStatus,
   loadGhosttyWasm,
   parseCell,
   writeString as wasmWriteString,
@@ -18,6 +24,11 @@ import {
 const DEFAULT_COLOR = 256;
 const GRAPHEME_BUFFER_BYTES = 256;
 const HYPERLINK_BUFFER_BYTES = 1024;
+// WebAssembly i32 results are surfaced to JS as signed numbers.
+const OUTPUT_ERROR = -1;
+const MAX_PASTE_BYTES = 1024 * 1024;
+const MAX_U16 = 0xffff;
+const MAX_U32 = 0xffff_ffff;
 const DEFAULT_FOREGROUND = "#d4d4d4";
 const DEFAULT_BACKGROUND = "#1e1e1e";
 
@@ -59,10 +70,137 @@ const BLANK_CELL: CellData = {
 };
 
 export interface GhosttyOptions {
+  /** Preferred WASM input. Supports URLs, bytes, and precompiled modules. */
+  wasmSource?: GhosttyWasmSource;
+  /** @deprecated Use `wasmSource` for new integrations. */
   wasmPath?: string;
   scrollbackLimit?: number;
   foregroundColor?: string;
   backgroundColor?: string;
+  effects?: "authority" | "discard";
+}
+
+export const GhosttyModifier = Object.freeze({
+  Shift: 1 << 0,
+  Control: 1 << 1,
+  Alt: 1 << 2,
+  Super: 1 << 3,
+  CapsLock: 1 << 4,
+  NumLock: 1 << 5,
+} as const);
+
+export interface GhosttyKeyEvent {
+  /** Logical DOM key, physical code, or a Ghostty snake_case key name. */
+  key: string;
+  /** Physical DOM code. When present, this is the key Ghostty encodes. */
+  code?: string;
+  text?: string;
+  modifiers?: number;
+  consumedModifiers?: number;
+  /** Remove the synthetic Ctrl+Alt pair browsers use for AltGraph text. */
+  altGraph?: boolean;
+  action?: "press" | "release" | "repeat";
+  repeat?: boolean;
+  composing?: boolean;
+  unshiftedCodepoint?: number;
+}
+
+export interface GhosttyDomKeyEvent {
+  type?: string;
+  code: string;
+  key: string;
+  shiftKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  repeat: boolean;
+  isComposing?: boolean;
+  getModifierState?(key: string): boolean;
+}
+
+export interface GhosttyNormalizedKeyEvent extends GhosttyKeyEvent {
+  code: string;
+  modifiers: number;
+  consumedModifiers: number;
+  altGraph: boolean;
+  action: "press" | "release" | "repeat";
+  composing: boolean;
+}
+
+export interface GhosttyEffectStats {
+  droppedFrames: number;
+  droppedBytes: number;
+}
+
+interface GridBufferAllocation {
+  viewportPtr: number;
+  viewportSize: number;
+  scrollbackPtr: number;
+  scrollbackSize: number;
+}
+
+const CHARACTER_KEYS: Readonly<Record<string, string>> = Object.freeze({
+  " ": "space",
+  "`": "backquote",
+  "\\": "backslash",
+  "[": "bracket_left",
+  "]": "bracket_right",
+  ",": "comma",
+  "=": "equal",
+  "-": "minus",
+  ".": "period",
+  "'": "quote",
+  ";": "semicolon",
+  "/": "slash",
+});
+
+/** Normalize the browser boundary once before a key crosses the wire. */
+export function ghosttyKeyEventFromDom(
+  event: GhosttyDomKeyEvent,
+): GhosttyNormalizedKeyEvent {
+  let modifiers = 0;
+  if (event.shiftKey) modifiers |= GhosttyModifier.Shift;
+  if (event.ctrlKey) modifiers |= GhosttyModifier.Control;
+  if (event.altKey) modifiers |= GhosttyModifier.Alt;
+  if (event.metaKey) modifiers |= GhosttyModifier.Super;
+  if (event.getModifierState?.("CapsLock"))
+    modifiers |= GhosttyModifier.CapsLock;
+  if (event.getModifierState?.("NumLock")) modifiers |= GhosttyModifier.NumLock;
+  const altGraph = event.getModifierState?.("AltGraph") ?? false;
+  if (altGraph) {
+    modifiers &= ~(GhosttyModifier.Control | GhosttyModifier.Alt);
+  }
+  const text = Array.from(event.key).length === 1 ? event.key : undefined;
+  const action =
+    event.type === "keyup" ? "release" : event.repeat ? "repeat" : "press";
+  return {
+    code: event.code,
+    key: event.key,
+    text,
+    modifiers,
+    consumedModifiers:
+      text === undefined ? 0 : modifiers & GhosttyModifier.Shift,
+    altGraph,
+    action,
+    composing: event.isComposing ?? false,
+  };
+}
+
+function normalizeKeyName(value: string): string {
+  const character = CHARACTER_KEYS[value];
+  if (character) return character;
+  if (/^[a-z]$/i.test(value)) return `key_${value.toLowerCase()}`;
+  if (/^[0-9]$/.test(value)) return `digit_${value}`;
+  if (/^Key[A-Z]$/.test(value)) return `key_${value.slice(3).toLowerCase()}`;
+  if (/^Digit[0-9]$/.test(value)) return `digit_${value.slice(5)}`;
+  if (/^Numpad[0-9]$/.test(value)) return `numpad_${value.slice(6)}`;
+  if (/^F(?:[1-9]|1[0-9]|2[0-5])$/.test(value)) return value.toLowerCase();
+  if (value === "OSLeft") return "meta_left";
+  if (value === "OSRight") return "meta_right";
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[ -]+/g, "_")
+    .toLowerCase();
 }
 
 function parseColor(value: string, option: string): number {
@@ -95,6 +233,7 @@ export class GhosttyCore implements TerminalCore {
   private _foregroundRgb: number;
   private _backgroundRgb: number;
   private _disposed = false;
+  private _poisoned = false;
 
   private _viewportBufPtr = 0;
   private _viewportBufSize = 0;
@@ -133,8 +272,21 @@ export class GhosttyCore implements TerminalCore {
    * The returned core is ready to be passed as the `core` option to `WTerm`.
    */
   static async load(options: GhosttyOptions = {}): Promise<GhosttyCore> {
-    const wasm = await loadGhosttyWasm(options.wasmPath);
+    if (options.wasmSource !== undefined && options.wasmPath !== undefined) {
+      throw new Error(
+        "@wterm/ghostty: pass either wasmSource or wasmPath, not both",
+      );
+    }
+    const wasm = await loadGhosttyWasm(options.wasmSource ?? options.wasmPath);
     return new GhosttyCore(wasm, options);
+  }
+
+  /** Create a core in an already-instantiated, reusable WASM runtime. */
+  static fromRuntime(
+    runtime: GhosttyRuntime,
+    options: Omit<GhosttyOptions, "wasmSource" | "wasmPath"> = {},
+  ): GhosttyCore {
+    return new GhosttyCore(runtime.wasm, options);
   }
 
   // -- Lifecycle --
@@ -146,23 +298,64 @@ export class GhosttyCore implements TerminalCore {
     if (this.termPtr !== 0) {
       throw new Error("@wterm/ghostty: core is already initialized");
     }
+    const scrollback = this._options.scrollbackLimit ?? 10000;
+    if (
+      !Number.isInteger(scrollback) ||
+      scrollback < 0 ||
+      scrollback > MAX_U32
+    ) {
+      throw new Error(
+        "@wterm/ghostty: scrollbackLimit must be an unsigned 32-bit integer",
+      );
+    }
+
+    let grid: GridBufferAllocation | undefined;
+    let graphemePtr = 0;
+    let hyperlinkPtr = 0;
+    let termPtr = 0;
+    try {
+      grid = this._allocateGridBuffers(cols, rows);
+      graphemePtr = this._allocateRequiredBuffer(
+        GRAPHEME_BUFFER_BYTES,
+        "grapheme",
+      );
+      hyperlinkPtr = this._allocateRequiredBuffer(
+        HYPERLINK_BUFFER_BYTES,
+        "hyperlink",
+      );
+      termPtr = this.wasm.exports.init(
+        cols,
+        rows,
+        scrollback,
+        this._foregroundRgb,
+        this._backgroundRgb,
+        this._options.effects === "discard" ? 0 : 1,
+      );
+      if (termPtr === 0) {
+        throw new Error("@wterm/ghostty: failed to initialize the WASM core");
+      }
+    } catch (error) {
+      if (termPtr !== 0) {
+        try {
+          this.wasm.exports.deinit(termPtr);
+        } catch {
+          // Preserve the initialization error after best-effort rollback.
+        }
+      }
+      if (grid) this._releaseGridBuffers(grid);
+      this._releaseBuffer(graphemePtr, GRAPHEME_BUFFER_BYTES);
+      this._releaseBuffer(hyperlinkPtr, HYPERLINK_BUFFER_BYTES);
+      throw error;
+    }
+
+    this.termPtr = termPtr;
     this._cols = cols;
     this._rows = rows;
-    const scrollback = this._options.scrollbackLimit ?? 10000;
-    this.termPtr = this.wasm.exports.init(
-      cols,
-      rows,
-      scrollback,
-      this._foregroundRgb,
-      this._backgroundRgb,
-    );
-    this._graphemeBufPtr = allocBuffer(this.wasm, GRAPHEME_BUFFER_BYTES);
-    if (this._hyperlinkBufPtr !== 0) {
-      freeBuffer(this.wasm, this._hyperlinkBufPtr, this._hyperlinkBufSize);
-    }
+    this._graphemeBufPtr = graphemePtr;
+    this._graphemeBufSize = GRAPHEME_BUFFER_BYTES;
+    this._hyperlinkBufPtr = hyperlinkPtr;
     this._hyperlinkBufSize = HYPERLINK_BUFFER_BYTES;
-    this._hyperlinkBufPtr = allocBuffer(this.wasm, HYPERLINK_BUFFER_BYTES);
-    this._allocViewportBuffer();
+    this._installGridBuffers(grid);
     this._invalidate();
   }
 
@@ -170,41 +363,17 @@ export class GhosttyCore implements TerminalCore {
     if (this._disposed) return;
     this._disposed = true;
 
-    const release = (cleanup: () => void): void => {
-      try {
-        cleanup();
-      } catch {
-        // Disposal is best-effort so one WASM trap cannot leak other resources.
-      }
-    };
-
     try {
-      if (this._viewportBufPtr !== 0) {
-        release(() =>
-          freeBuffer(this.wasm, this._viewportBufPtr, this._viewportBufSize),
-        );
-      }
-      if (this._scrollbackBufPtr !== 0) {
-        release(() =>
-          freeBuffer(
-            this.wasm,
-            this._scrollbackBufPtr,
-            this._scrollbackBufSize,
-          ),
-        );
-      }
-      if (this._graphemeBufPtr !== 0) {
-        release(() =>
-          freeBuffer(this.wasm, this._graphemeBufPtr, this._graphemeBufSize),
-        );
-      }
-      if (this._hyperlinkBufPtr !== 0) {
-        release(() =>
-          freeBuffer(this.wasm, this._hyperlinkBufPtr, this._hyperlinkBufSize),
-        );
-      }
+      this._releaseBuffer(this._viewportBufPtr, this._viewportBufSize);
+      this._releaseBuffer(this._scrollbackBufPtr, this._scrollbackBufSize);
+      this._releaseBuffer(this._graphemeBufPtr, this._graphemeBufSize);
+      this._releaseBuffer(this._hyperlinkBufPtr, this._hyperlinkBufSize);
       if (this.termPtr !== 0) {
-        release(() => this.wasm.exports.deinit(this.termPtr));
+        try {
+          this.wasm.exports.deinit(this.termPtr);
+        } catch {
+          // Disposal is best-effort so one trap cannot skip state cleanup.
+        }
       }
     } finally {
       this.termPtr = 0;
@@ -225,24 +394,157 @@ export class GhosttyCore implements TerminalCore {
     }
   }
 
-  resize(cols: number, rows: number): void {
-    this._cols = cols;
-    this._rows = rows;
-    this.wasm.exports.resize(this.termPtr, cols, rows);
-    this._allocViewportBuffer();
-    this._invalidate();
+  resize(cols: number, rows: number, widthPx = 0, heightPx = 0): void {
+    this._assertOperational();
+    const grid = this._allocateGridBuffers(cols, rows);
+    let status: number;
+    try {
+      status = this.wasm.exports.resize(
+        this.termPtr,
+        cols,
+        rows,
+        widthPx,
+        heightPx,
+      );
+    } catch {
+      this._releaseGridBuffers(grid);
+      const error = new GhosttyMutationError(
+        "terminal resize",
+        -1,
+        "the WASM adapter trapped with an unknown commit state",
+      );
+      this._recordMutationFailure(error);
+      throw error;
+    }
+    if (
+      status === WASM_MUTATION_STATUS.ok ||
+      status === WASM_MUTATION_STATUS.effectOverflow
+    ) {
+      this._cols = cols;
+      this._rows = rows;
+      this._installGridBuffers(grid);
+      this._invalidate();
+    } else {
+      this._releaseGridBuffers(grid);
+    }
+    try {
+      assertMutationStatus(status, "terminal resize");
+    } catch (error) {
+      this._recordMutationFailure(error);
+      throw error;
+    }
   }
 
   // -- I/O --
 
   writeString(str: string): void {
-    wasmWriteString(this.wasm, this.termPtr, str);
-    this._invalidate();
+    this._assertOperational();
+    try {
+      wasmWriteString(this.wasm, this.termPtr, str);
+    } catch (error) {
+      this._recordMutationFailure(error);
+      throw error;
+    } finally {
+      // Ghostty may mutate before reporting a semantic or effect failure.
+      this._invalidate();
+    }
   }
 
   writeRaw(data: Uint8Array): void {
-    wasmWriteBytes(this.wasm, this.termPtr, data);
-    this._invalidate();
+    this._assertOperational();
+    try {
+      wasmWriteBytes(this.wasm, this.termPtr, data);
+    } catch (error) {
+      this._recordMutationFailure(error);
+      throw error;
+    } finally {
+      this._invalidate();
+    }
+  }
+
+  /** Encode a semantic key against the authoritative terminal modes. */
+  encodeKey(event: GhosttyKeyEvent): Uint8Array {
+    this._assertOperational();
+    const key = new TextEncoder().encode(
+      normalizeKeyName(event.code || event.key),
+    );
+    const inferredText = Array.from(event.key).length === 1 ? event.key : "";
+    const text = new TextEncoder().encode(event.text ?? inferredText);
+    const altGraphMask = GhosttyModifier.Control | GhosttyModifier.Alt;
+    const modifiers =
+      (event.modifiers ?? 0) & (event.altGraph ? ~altGraphMask : 0xffff);
+    const consumedModifiers =
+      event.consumedModifiers ??
+      (text.length > 0 ? modifiers & GhosttyModifier.Shift : 0);
+    const action = event.action ?? (event.repeat ? "repeat" : "press");
+    const actionRaw = action === "release" ? 0 : action === "press" ? 1 : 2;
+
+    return this._withTransfer(key.length + text.length, (base) => {
+      const memory = new Uint8Array(this.wasm.exports.memory.buffer);
+      memory.set(key, base);
+      memory.set(text, base + key.length);
+      const len = this.wasm.exports.encode_key(
+        this.termPtr,
+        base,
+        key.length,
+        base + key.length,
+        text.length,
+        modifiers & 0xffff,
+        consumedModifiers & modifiers & 0xffff,
+        actionRaw,
+        event.composing ? 1 : 0,
+        event.unshiftedCodepoint ?? 0,
+      );
+      return this._copyOutput(len, "key encoding");
+    });
+  }
+
+  /** Encode paste framing and sanitization from current terminal state. */
+  encodePaste(data: Uint8Array | string): Uint8Array {
+    this._assertOperational();
+    const bytes =
+      typeof data === "string" ? new TextEncoder().encode(data) : data;
+    if (bytes.length > MAX_PASTE_BYTES) {
+      throw new Error(`@wterm/ghostty: paste exceeds ${MAX_PASTE_BYTES} bytes`);
+    }
+    return this._withTransfer(bytes.length, (ptr) => {
+      if (bytes.length > 0) {
+        new Uint8Array(this.wasm.exports.memory.buffer, ptr, bytes.length).set(
+          bytes,
+        );
+      }
+      return this._copyOutput(
+        this.wasm.exports.encode_paste(this.termPtr, ptr, bytes.length),
+        "paste encoding",
+      );
+    });
+  }
+
+  /** Encode a focus report when mode 1004 is enabled. */
+  encodeFocus(focused: boolean): Uint8Array {
+    this._assertOperational();
+    return this._copyOutput(
+      this.wasm.exports.encode_focus(this.termPtr, focused ? 1 : 0),
+      "focus encoding",
+    );
+  }
+
+  /** Encode a synchronous Ghostty binary checkpoint, including continuation. */
+  encodeSnapshot(): Uint8Array {
+    this._assertOperational();
+    return this._copyOutput(
+      this.wasm.exports.encode_snapshot(this.termPtr),
+      "snapshot encoding",
+    );
+  }
+
+  /** Export the exact replay-safe parser continuation retained by Ghostty. */
+  getContinuation(): Uint8Array {
+    this._assertOperational();
+    return this._copyOutput(
+      this.wasm.exports.export_continuation(this.termPtr),
+      "continuation export",
+    );
   }
 
   // -- Grid --
@@ -292,6 +594,7 @@ export class GhosttyCore implements TerminalCore {
   }
 
   clearDirty(): void {
+    this._assertOperational();
     this.wasm.exports.clear_dirty(this.termPtr);
     this._viewportStale = true;
   }
@@ -318,70 +621,93 @@ export class GhosttyCore implements TerminalCore {
   // -- Modes --
 
   cursorKeysApp(): boolean {
+    this._assertOperational();
     return this.wasm.exports.cursor_keys_app(this.termPtr) !== 0;
   }
 
   bracketedPaste(): boolean {
+    this._assertOperational();
     return this.wasm.exports.bracketed_paste(this.termPtr) !== 0;
   }
 
   usingAltScreen(): boolean {
+    this._assertOperational();
     return this.wasm.exports.using_alt_screen(this.termPtr) !== 0;
   }
 
   mouseTracking(): 0 | 1000 | 1002 {
+    this._assertOperational();
     const mode = this.wasm.exports.mouse_tracking(this.termPtr);
     return mode === 1000 || mode === 1002 ? mode : 0;
   }
 
   mouseSgr(): boolean {
+    this._assertOperational();
     return this.wasm.exports.mouse_sgr(this.termPtr) !== 0;
   }
 
   focusEvents(): boolean {
+    this._assertOperational();
     return this.wasm.exports.focus_events(this.termPtr) !== 0;
   }
 
   synchronizedOutput(): boolean {
+    this._assertOperational();
     return this.wasm.exports.synchronized_output(this.termPtr) !== 0;
   }
 
   synchronizedOutputGeneration(): number {
+    this._assertOperational();
     return this.wasm.exports.synchronized_output_generation(this.termPtr);
   }
 
   // -- Side outputs --
 
   getTitle(): string | null {
-    // Title changes are delivered through OSC sequences which the
-    // ReadonlyStream handler doesn't capture. A full stream handler
-    // would be needed for title support.
+    // Title changes are not bridged into the current binary effect contract.
     return null;
   }
 
   getResponse(): string | null {
-    const bufSize = 4096;
-    const bufPtr = allocBuffer(this.wasm, bufSize);
-    if (bufPtr === 0) return null;
-    const len = this.wasm.exports.read_response(this.termPtr, bufPtr, bufSize);
-    if (len === 0) {
-      freeBuffer(this.wasm, bufPtr, bufSize);
-      return null;
+    this._assertInitialized();
+    const effect = this._readEffect();
+    return effect ? new TextDecoder().decode(effect) : null;
+  }
+
+  /** Drain copied WRITE_PTY effect frames in production order. */
+  drainEffects(maxFrames = 256): Uint8Array[] {
+    this._assertInitialized();
+    if (!Number.isInteger(maxFrames) || maxFrames < 0 || maxFrames > 256) {
+      throw new Error("@wterm/ghostty: maxFrames must be between 0 and 256");
     }
-    const bytes = new Uint8Array(this.wasm.exports.memory.buffer, bufPtr, len);
-    const text = new TextDecoder().decode(bytes);
-    freeBuffer(this.wasm, bufPtr, bufSize);
-    return text;
+    const effects: Uint8Array[] = [];
+    while (effects.length < maxFrames) {
+      const effect = this._readEffect();
+      if (!effect) break;
+      effects.push(effect);
+    }
+    return effects;
+  }
+
+  getEffectStats(): GhosttyEffectStats {
+    this._assertInitialized();
+    return {
+      droppedFrames:
+        this.wasm.exports.dropped_effect_frames(this.termPtr) >>> 0,
+      droppedBytes: this.wasm.exports.dropped_effect_bytes(this.termPtr) >>> 0,
+    };
+  }
+
+  /** Fatal mutation failures poison the core so they cannot be retried. */
+  isPoisoned(): boolean {
+    return this._poisoned;
   }
 
   // -- Scrollback --
 
   getScrollbackCount(): number {
+    this._assertOperational();
     return this.wasm.exports.get_scrollback_count(this.termPtr);
-  }
-
-  getScrollbackDiscardedCount(): number {
-    return this.wasm.exports.get_scrollback_discarded_count(this.termPtr);
   }
 
   getScrollbackCell(offset: number, col: number): CellData {
@@ -420,6 +746,79 @@ export class GhosttyCore implements TerminalCore {
 
   // -- Internal helpers --
 
+  private _withTransfer<T>(
+    byteLength: number,
+    operation: (ptr: number) => T,
+  ): T {
+    const allocationSize = Math.max(1, byteLength);
+    const ptr = allocBuffer(this.wasm, allocationSize);
+    if (ptr === 0) {
+      throw new Error("@wterm/ghostty: WASM transfer allocation failed");
+    }
+    try {
+      return operation(ptr);
+    } finally {
+      freeBuffer(this.wasm, ptr, allocationSize);
+    }
+  }
+
+  private _assertOperational(): void {
+    this._assertInitialized();
+    if (this._poisoned) {
+      throw new Error(
+        "@wterm/ghostty: core is poisoned after a fatal mutation; drain effects and terminate the session",
+      );
+    }
+  }
+
+  private _assertInitialized(): void {
+    if (this._disposed) {
+      throw new Error("@wterm/ghostty: core has been disposed");
+    }
+    if (this.termPtr === 0) {
+      throw new Error("@wterm/ghostty: core is not initialized");
+    }
+  }
+
+  private _recordMutationFailure(error: unknown): void {
+    if (error instanceof GhosttyMutationError && error.fatal) {
+      this._poisoned = true;
+    }
+  }
+
+  private _copyOutput(len: number, operation: string): Uint8Array {
+    try {
+      if (len === OUTPUT_ERROR) {
+        throw new Error(`@wterm/ghostty: ${operation} failed`);
+      }
+      if (this.wasm.exports.output_len(this.termPtr) !== len) {
+        throw new Error(
+          `@wterm/ghostty: ${operation} returned an invalid length`,
+        );
+      }
+      if (len === 0) return new Uint8Array();
+      const ptr = this.wasm.exports.output_ptr(this.termPtr);
+      if (ptr === 0) {
+        throw new Error(`@wterm/ghostty: ${operation} returned a null buffer`);
+      }
+      return new Uint8Array(this.wasm.exports.memory.buffer, ptr, len).slice();
+    } finally {
+      this.wasm.exports.clear_output(this.termPtr);
+    }
+  }
+
+  private _readEffect(): Uint8Array | null {
+    const len = this.wasm.exports.next_effect_len(this.termPtr);
+    if (len === 0) return null;
+    return this._withTransfer(len, (ptr) => {
+      const written = this.wasm.exports.read_effect(this.termPtr, ptr, len);
+      if (written !== len) {
+        throw new Error("@wterm/ghostty: PTY effect queue read failed");
+      }
+      return new Uint8Array(this.wasm.exports.memory.buffer, ptr, len).slice();
+    });
+  }
+
   private _invalidate(): void {
     this._viewportStale = true;
     this._scrollbackOffset = -1;
@@ -438,20 +837,22 @@ export class GhosttyCore implements TerminalCore {
 
   private _ensureGraphemeBuffer(required: number): void {
     if (required <= this._graphemeBufSize) return;
-    if (this._graphemeBufPtr !== 0) {
-      freeBuffer(this.wasm, this._graphemeBufPtr, this._graphemeBufSize);
-    }
+    const next = this._allocateRequiredBuffer(required, "grapheme");
+    const previousPtr = this._graphemeBufPtr;
+    const previousSize = this._graphemeBufSize;
+    this._graphemeBufPtr = next;
     this._graphemeBufSize = required;
-    this._graphemeBufPtr = allocBuffer(this.wasm, required);
+    this._releaseBuffer(previousPtr, previousSize);
   }
 
   private _ensureHyperlinkBuffer(required: number): void {
     if (required <= this._hyperlinkBufSize) return;
-    if (this._hyperlinkBufPtr !== 0) {
-      freeBuffer(this.wasm, this._hyperlinkBufPtr, this._hyperlinkBufSize);
-    }
+    const next = this._allocateRequiredBuffer(required, "hyperlink");
+    const previousPtr = this._hyperlinkBufPtr;
+    const previousSize = this._hyperlinkBufSize;
+    this._hyperlinkBufPtr = next;
     this._hyperlinkBufSize = required;
-    this._hyperlinkBufPtr = allocBuffer(this.wasm, required);
+    this._releaseBuffer(previousPtr, previousSize);
   }
 
   private _readHyperlink(
@@ -553,22 +954,82 @@ export class GhosttyCore implements TerminalCore {
     return this._decodeGrapheme(len);
   }
 
-  private _allocViewportBuffer(): void {
-    if (this._viewportBufPtr !== 0) {
-      freeBuffer(this.wasm, this._viewportBufPtr, this._viewportBufSize);
+  private _allocateRequiredBuffer(size: number, purpose: string): number {
+    const ptr = allocBuffer(this.wasm, size);
+    if (ptr === 0) {
+      throw new Error(
+        `@wterm/ghostty: failed to allocate the ${purpose} buffer`,
+      );
     }
-    this._viewportBufSize = this._cols * this._rows * CELL_BYTES;
-    this._viewportBufPtr = allocBuffer(this.wasm, this._viewportBufSize);
+    return ptr;
+  }
+
+  private _allocateGridBuffers(
+    cols: number,
+    rows: number,
+  ): GridBufferAllocation {
+    if (
+      !Number.isInteger(cols) ||
+      !Number.isInteger(rows) ||
+      cols < 1 ||
+      rows < 1 ||
+      cols > MAX_U16 ||
+      rows > MAX_U16
+    ) {
+      throw new Error(
+        "@wterm/ghostty: terminal dimensions must be positive 16-bit integers",
+      );
+    }
+    const viewportSize = cols * rows * CELL_BYTES;
+    if (viewportSize > MAX_U32) {
+      throw new Error("@wterm/ghostty: terminal viewport buffer is too large");
+    }
+    const scrollbackSize = cols * CELL_BYTES;
+    const viewportPtr = this._allocateRequiredBuffer(viewportSize, "viewport");
+    let scrollbackPtr = 0;
+    try {
+      scrollbackPtr = this._allocateRequiredBuffer(
+        scrollbackSize,
+        "scrollback",
+      );
+    } catch (error) {
+      this._releaseBuffer(viewportPtr, viewportSize);
+      throw error;
+    }
+    return { viewportPtr, viewportSize, scrollbackPtr, scrollbackSize };
+  }
+
+  private _installGridBuffers(next: GridBufferAllocation): void {
+    const previous: GridBufferAllocation = {
+      viewportPtr: this._viewportBufPtr,
+      viewportSize: this._viewportBufSize,
+      scrollbackPtr: this._scrollbackBufPtr,
+      scrollbackSize: this._scrollbackBufSize,
+    };
+    this._viewportBufPtr = next.viewportPtr;
+    this._viewportBufSize = next.viewportSize;
     this._viewportView = null;
     this._viewportStale = true;
-
-    if (this._scrollbackBufPtr !== 0) {
-      freeBuffer(this.wasm, this._scrollbackBufPtr, this._scrollbackBufSize);
-    }
-    this._scrollbackBufSize = this._cols * CELL_BYTES;
-    this._scrollbackBufPtr = allocBuffer(this.wasm, this._scrollbackBufSize);
+    this._scrollbackBufPtr = next.scrollbackPtr;
+    this._scrollbackBufSize = next.scrollbackSize;
     this._scrollbackView = null;
     this._scrollbackOffset = -1;
+    this._scrollbackLen = 0;
+    this._releaseGridBuffers(previous);
+  }
+
+  private _releaseGridBuffers(buffers: GridBufferAllocation): void {
+    this._releaseBuffer(buffers.viewportPtr, buffers.viewportSize);
+    this._releaseBuffer(buffers.scrollbackPtr, buffers.scrollbackSize);
+  }
+
+  private _releaseBuffer(ptr: number, size: number): void {
+    if (ptr === 0) return;
+    try {
+      freeBuffer(this.wasm, ptr, size);
+    } catch {
+      // Best-effort release keeps the currently installed state usable.
+    }
   }
 
   /**
@@ -577,6 +1038,7 @@ export class GhosttyCore implements TerminalCore {
    * by column, so without this each cell would cost a page-list walk.
    */
   private _ensureScrollbackLine(offset: number): number {
+    this._assertOperational();
     if (this._scrollbackBufPtr === 0) return 0;
 
     if (this._scrollbackOffset !== offset) {
@@ -602,9 +1064,33 @@ export class GhosttyCore implements TerminalCore {
   }
 
   private _ensureViewport(): void {
+    this._assertOperational();
     if (this._viewportStale) {
-      this.wasm.exports.update(this.termPtr);
-      this.wasm.exports.get_viewport(this.termPtr, this._viewportBufPtr);
+      let renderStatus: number;
+      try {
+        renderStatus = this.wasm.exports.update(this.termPtr);
+      } catch {
+        this._failRender("Ghostty trapped while updating RenderState");
+      }
+      if (renderStatus !== 0) {
+        this._failRender("Ghostty could not update RenderState");
+      }
+      const expected = this._cols * this._rows;
+      let written: number;
+      try {
+        written = this.wasm.exports.get_viewport(
+          this.termPtr,
+          this._viewportBufPtr,
+          expected,
+        );
+      } catch {
+        this._failRender("Ghostty trapped while exporting the viewport");
+      }
+      if (written !== expected) {
+        this._failRender(
+          `viewport export returned ${written} cells; expected ${expected}`,
+        );
+      }
       this._viewportStale = false;
     }
     if (this._viewportView?.buffer !== this.wasm.exports.memory.buffer) {
@@ -614,5 +1100,10 @@ export class GhosttyCore implements TerminalCore {
         this._viewportBufSize,
       );
     }
+  }
+
+  private _failRender(reason: string): never {
+    this._poisoned = true;
+    throw new GhosttyRenderError(reason);
   }
 }

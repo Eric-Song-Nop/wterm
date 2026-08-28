@@ -11,16 +11,18 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
-    "./ghostty-vt.wasm": "./wasm/ghostty-vt.wasm"
+    "./ghostty-vt.wasm": "./wasm/ghostty-vt.wasm",
+    "./engine-manifest.json": "./engine-manifest.json"
   },
   "files": [
     "dist",
-    "wasm"
+    "wasm",
+    "engine-manifest.json"
   ],
   "scripts": {
     "build": "tsc",
-    "prepublishOnly": "pnpm build",
-    "test": "vitest run",
+    "prepublishOnly": "node scripts/generate-engine.mjs check && pnpm build",
+    "test": "node scripts/generate-engine.mjs check && vitest run",
     "type-check": "tsc --noEmit",
     "rebuild-wasm": "bash scripts/build-wasm.sh",
     "rebuild-wasm:docker": "bash scripts/build-wasm-docker.sh"

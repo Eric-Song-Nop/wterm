@@ -176,7 +176,7 @@ describe("GhosttyCore scrollback readback", () => {
     expect(rowText(core, 1)).toBe(before);
   });
 
-  it("counts rows discarded from the oldest end", async () => {
+  it("does not fabricate an unavailable cumulative discarded-row count", async () => {
     const core = await GhosttyCore.load({
       wasmPath: WASM_URL,
       scrollbackLimit: 4096,
@@ -185,7 +185,7 @@ describe("GhosttyCore scrollback readback", () => {
     fill(core, 5000);
 
     expect(core.getScrollbackCount()).toBeGreaterThan(0);
-    expect(core.getScrollbackDiscardedCount()).toBeGreaterThan(0);
+    expect("getScrollbackDiscardedCount" in core).toBe(false);
   });
 });
 
