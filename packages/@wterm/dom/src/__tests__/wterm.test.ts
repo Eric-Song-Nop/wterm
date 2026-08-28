@@ -662,6 +662,28 @@ describe("WTerm", () => {
       expect([term.cols, term.rows]).toEqual([120, 40]);
     });
 
+    it("keeps rendered rows when authoritative geometry repeats the active grid", async () => {
+      vi.mocked(mockBridge.getCell).mockReturnValue({
+        char: 65,
+        fg: 256,
+        bg: 256,
+        flags: 0,
+      });
+      const setup = vi.spyOn(Renderer.prototype, "setup");
+      const term = new WTerm(element, { autoResize: false });
+      await term.init();
+      const rendered = element.querySelector(".term-grid")?.textContent;
+      vi.mocked(mockBridge.isDirtyRow).mockReturnValue(false);
+      setup.mockClear();
+
+      term.resize(80, 24, 800, 400);
+
+      expect(mockBridge.resize).toHaveBeenLastCalledWith(80, 24, 800, 400);
+      expect(setup).not.toHaveBeenCalled();
+      expect(element.querySelector(".term-grid")?.textContent).toBe(rendered);
+      term.destroy();
+    });
+
     it("fires the onResize callback", async () => {
       const onResize = vi.fn();
       const term = new WTerm(element, { autoResize: false, onResize });
